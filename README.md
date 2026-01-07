@@ -86,6 +86,7 @@ python main.py
 
 ---
 
+```
 ## 🔐 Security Notes
 
 🔒 Session strings are never shared or transmitted
@@ -97,7 +98,11 @@ python main.py
 🔒 Self-destructing media is downloaded instantly to avoid expiration
 ⚠️ Using /skip (bot API credentials) increases ban risk
 Recommended: Always use your own API_ID & API_HASH
-⚠️ Disclaimer
+
+---
+
+## ⚠️ Disclaimer
+
 This project is provided for educational and research purposes only.
 The developer is not responsible for misuse
 You are responsible for complying with:
@@ -105,9 +110,11 @@ Telegram Terms of Service
 Local and international laws
 Do not use this bot to violate privacy
 Do not distribute captured content without consent
+
 ❗ Telegram explicitly restricts bots from accessing self-destructing media.
 This bot works by user-authorized account sessions, not by bypassing Telegram security.
-🧠 Important Limitations
+
+## 🧠 Important Limitations
 Bots cannot directly save TTL media
 User login is mandatory for auto-saving
 Only private chats are monitored

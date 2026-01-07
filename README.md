@@ -35,6 +35,33 @@ This project uses:
 5. File is saved locally and uploaded to the configured channel
 
 ---
+## 🛠 Admin Commands
+
+**Command Description**
+
+/setchannel <id> - Set upload channel
+/currentchannel - Show channel
+/testchannel - Test permissions
+/files - List saved files
+/download <path> - Download file
+/delete <path> - Delete file
+/zip - ZIP all media
+/all - Send all media
+/status - Statistics
+/ping - Network test
+
+---
+
+## 👤 User Commands
+
+**Command Description**
+
+/login - Login user account
+/logout - Logout user
+/mystatus - Show login status
+/savetips - TTL saving guide
+
+---
 
 ## 📦 Installation
 
@@ -43,4 +70,4 @@ This project uses:
 git clone https://github.com/yourusername/Self-Destructing-Media-Downloader.git
 cd Self-Destructing-Media-Downloader
 pip install -r requirements.txt
-python main.py```
+python main.py

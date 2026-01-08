@@ -40,6 +40,7 @@ This project uses:
 
 **Channel Commands:**
 
+
 `/setchannel` <id> - Set global channel for bot files
 
 `/currentchannel` - Show current channel config 
@@ -47,6 +48,7 @@ This project uses:
 `/testchannel` - Test global channel access
 
 **File Management Commands:**
+
 
 `/files` - List all files in Media folder only
 
@@ -65,6 +67,7 @@ This project uses:
 
 **Log Management Commands:**
 
+
 `/logs` [lines] [search] - View bot logs (default: 50 lines)
 
 `/clearlogs` - Clear log file (creates backup)
@@ -76,6 +79,7 @@ This project uses:
 
 **System Commands:**
 
+
 `/ping` - Check bot status and network latency
 
 `/status` - Show download statistics
@@ -83,6 +87,7 @@ This project uses:
 `/help` - Show this help message
 
 **User Session Commands:**
+
 
 `/login` - Login with your own Telegram account
 
@@ -93,6 +98,7 @@ This project uses:
 `/savetips` - Tips for saving self-destructing media
 
 **User Channel Commands:**
+
 
 `/mychannel` - Show user's personal channel
 

@@ -123,12 +123,19 @@ python main.py
 ## 🔐 Security Notes
 
 🔒 Session strings are never shared or transmitted
+
 🔒 API credentials are used only during login
+
 🔒 Bot cannot access chats unless the user logs in
+
 🔒 Users can revoke access anytime using /logout
+
 🔒 No passwords or OTPs are logged
+
 🔒 Bot ignores all outgoing messages automatically
+
 🔒 Self-destructing media is downloaded instantly to avoid expiration
+
 ⚠️ Using /skip (bot API credentials) increases ban risk
 
 Recommended: Always use your own API_ID & API_HASH
@@ -138,7 +145,8 @@ Recommended: Always use your own API_ID & API_HASH
 ## ⚠️ Disclaimer
 
 This project is provided for educational and research purposes only.
-The developer is not responsible for misuse
+The developer is not responsible for misuse.
+
 You are responsible for complying with:
 Telegram Terms of Service
 Local and international laws

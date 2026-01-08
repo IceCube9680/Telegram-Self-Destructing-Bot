@@ -39,40 +39,62 @@ This project uses:
 **Command Description**
 
 **Channel Commands:**
+
 `/setchannel` <id> - Set global channel for bot files
 
 `/currentchannel` - Show current channel config 
+
 `/testchannel` - Test global channel access
 
 **File Management Commands:**
+
 `/files` - List all files in Media folder only
+
 `/check` - Check for new files in media folder
+
 `/download` <path> - Download specific file
+
 `/delete` <path> - Delete specific file
+
 `/confirm_delete `<path> - Confirm file deletion
+
 `/all` - Download all media files from media folder
+
 `/zip` - Create and send ZIP archive of Media folder
 
+
 **Log Management Commands:**
+
 `/logs` [lines] [search] - View bot logs (default: 50 lines)
+
 `/clearlogs` - Clear log file (creates backup)
+
 `/download_logs` - Download entire log file
+
 `/loglevel` <level> - Change log level (DEBUG, INFO, WARNING, ERROR)
+
 
 **System Commands:**
 `/ping` - Check bot status and network latency
+
 `/status` - Show download statistics
+
 `/help` - Show this help message
 
 **User Session Commands:**
 `/login` - Login with your own Telegram account
+
 `/logout` - Logout from your account
+
 `/mystatus` - Check your login status
+
 `/savetips` - Tips for saving self-destructing media
 
 **User Channel Commands:**
 `/mychannel` - Show user's personal channel
+
 `/mychanneltest` - Test user's personal channel
+
 `/setchannel` <id> - Users can set their own channel
 
 ---

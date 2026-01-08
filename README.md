@@ -40,7 +40,8 @@ This project uses:
 
 **Channel Commands:**
 `/setchannel` <id> - Set global channel for bot files
-`/currentchannel` - Show current channel config
+
+`/currentchannel` - Show current channel config 
 `/testchannel` - Test global channel access
 
 **File Management Commands:**

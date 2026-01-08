@@ -23,13 +23,24 @@ if not os.path.exists(all_media_dir):
     os.makedirs(all_media_dir)
 
 # Configure logging
+LOG_FILE = "bot.log"
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-log_handler = logging.StreamHandler()
-log_handler.setFormatter(formatter)
-log_handler.setLevel(logging.INFO)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+console_handler.setLevel(logging.INFO)
+
+# File handler
+file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+file_handler.setFormatter(formatter)
+file_handler.setLevel(logging.INFO)
+
+# Setup logger
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-logger.addHandler(log_handler)
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 console = Console()
 SETTINGS_FILE = "settings.json"
@@ -43,6 +54,8 @@ BOT_API_ID = None
 BOT_API_HASH = None
 # Store active user clients
 ACTIVE_USER_CLIENTS = {}
+# Store bot client globally
+BOT_CLIENT = None
 
 
 async def load_config():
@@ -108,7 +121,7 @@ async def create_new_config():
 
 
 async def update_channel_id(new_channel_id):
-    """Update channel ID in settings file"""
+    """Update global channel ID in settings file"""
     if os.path.exists(SETTINGS_FILE):
         async with aiofiles.open(SETTINGS_FILE, mode="r") as file:
             settings = json.loads(await file.read())
@@ -120,6 +133,23 @@ async def update_channel_id(new_channel_id):
         
         return True
     return False
+
+
+async def update_user_channel_id(user_id, new_channel_id, state):
+    """Update channel ID for a specific user in state"""
+    if str(user_id) in state.get("user_sessions", {}):
+        state["user_sessions"][str(user_id)]["channel_id"] = new_channel_id
+        await save_state(state)
+        return True
+    return False
+
+
+async def get_user_channel_id(user_id, state):
+    """Get channel ID for a specific user"""
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    if user_session:
+        return user_session.get("channel_id")
+    return None
 
 
 async def load_state():
@@ -210,18 +240,14 @@ async def handle_start(event, admin_id):
             "This bot can download media files and save them to a channel.\n\n"
             "**Features:**\n"
             "• Download photos, videos, documents\n"
-            "• Send files to configured channel\n"
-            "• Organized file storage\n"
+            "• Send files to your personal channel\n"
             "• Progress tracking\n\n"
+            "**For Users:**\n"
+            "1. Use /login to login with your own account\n"
+            "2. Use /setchannel to set your personal channel\n"
+            "3. Your self-destructing media will be saved to your channel\n\n"
             "**For Admin:**\n"
             "Use /help to see all available commands.\n\n"
-            "**For Users:**\n"
-            "To use your own account, use /login command.\n"
-            "This will allow you to download media from your own chats.\n\n"
-            "**For Self-Destructing Media:**\n"
-            "1. Use /login to login with your own account\n"
-            "2. When you receive self-destructing media in your account\n"
-            "3. Bot will automatically save it and send to channel\n\n"
             "Enjoy using the bot!"
         )
         await event.reply(welcome_message, parse_mode='markdown')
@@ -241,6 +267,8 @@ async def handle_login(event, admin_id, bot_client, state):
         await event.reply(
             "✅ You are already logged in!\n"
             "You can now receive and save self-destructing media from your account.\n\n"
+            "Set your personal channel: /setchannel\n"
+            "Check your status: /mystatus\n\n"
             "To logout, use /logout command."
         )
         return
@@ -620,35 +648,42 @@ async def handle_2fa(event, admin_id, state):
 
 async def setup_user_client_handlers(user_client, user_id, bot_client, state):
     """Setup event handlers for user client to catch self-destructing media"""
-
-    @user_client.on(events.NewMessage(func=lambda e: e.is_private))
+    
+    console.print(f"[yellow]Setting up handlers for user {user_id}[/yellow]")
+    
+    @user_client.on(events.NewMessage(incoming=True))
     async def user_media_handler(event):
         try:
             # 🚫 Ignore outgoing messages
             if event.out:
                 return
 
-            # 🚫 Ignore empty/service messages
-            if not event.message or not event.media:
+            # 🚫 Ignore messages without media
+            if not event.media:
                 return
 
             msg = event.message
 
-            # ✅ FULL TTL DETECTION (ALL REAL CASES)
+            # ✅ Check for TTL (self-destructing media)
             ttl = None
+            if hasattr(msg, 'media') and msg.media:
+                if hasattr(msg.media, 'ttl_seconds'):
+                    ttl = msg.media.ttl_seconds
+                elif hasattr(msg.media, 'photo') and hasattr(msg.media.photo, 'ttl_seconds'):
+                    ttl = msg.media.photo.ttl_seconds
+                elif hasattr(msg.media, 'document') and hasattr(msg.media.document, 'ttl_seconds'):
+                    ttl = msg.media.document.ttl_seconds
 
-            if msg.media:
-                ttl = (
-                    getattr(msg.media, "ttl_seconds", None)
-                    or getattr(getattr(msg.media, "photo", None), "ttl_seconds", None)
-                    or getattr(getattr(msg.media, "document", None), "ttl_seconds", None)
-                )
+            console.print(f"[cyan]User {user_id} received media, TTL: {ttl}[/cyan]")
 
-            # ❌ Ignore normal media
+            # ❌ Ignore normal media (no TTL)
             if not ttl:
+                console.print(f"[yellow]Normal media ignored for user {user_id}[/yellow]")
                 return
 
-            # ✅ CRITICAL: DOWNLOAD FIRST (NO DELAY)
+            console.print(f"[green]Self-destructing media detected for user {user_id} (TTL: {ttl}s)[/green]")
+            
+            # ✅ Download immediately
             await user_downloader(
                 event,
                 user_client,
@@ -657,14 +692,12 @@ async def setup_user_client_handlers(user_client, user_id, bot_client, state):
                 state
             )
 
-            # 🟢 OPTIONAL: log AFTER successful download
-            console.print(
-                f"[magenta]SELF-DESTRUCTING MEDIA SAVED "
-                f"(TTL={ttl}) for user {user_id}[/magenta]"
-            )
+            console.print(f"[magenta]Media saved for user {user_id}[/magenta]")
 
         except Exception as e:
-            logger.debug(f"User media handler skipped for {user_id}: {e}")
+            console.print(f"[red]Error in user media handler for {user_id}: {e}[/red]")
+            logger.error(f"User media handler error for {user_id}: {e}")
+
 
 async def complete_user_login(event, user_id, user_client, state):
     """Complete user login process"""
@@ -691,7 +724,8 @@ async def complete_user_login(event, user_id, user_client, state):
             "first_name": me.first_name,
             "last_name": me.last_name,
             "session_file": user_session_file,
-            "login_time": time.time()
+            "login_time": time.time(),
+            "channel_id": None  # Initialize with no channel
         }
         
         # Clean up login session
@@ -700,7 +734,7 @@ async def complete_user_login(event, user_id, user_client, state):
         
         await save_state(state)
         
-        # Get bot client (we'll store it in global variable from main)
+        # Get bot client
         global BOT_CLIENT
         if BOT_CLIENT:
             # Setup handlers for user client
@@ -722,21 +756,19 @@ async def complete_user_login(event, user_id, user_client, state):
             f"• Phone: {me.phone}\n"
             f"• User ID: {me.id}\n\n"
             f"📱 **Now you can:**\n"
-            f"• Self-destructing media will be automatically saved\n"
-            f"• Files will be saved in organized folders\n"
-            f"• Files will be sent to configured channel\n"
+            f"• Set your personal channel: /setchannel\n"
+            f"• Self-destructing media will be automatically saved to your channel\n"
             f"• Use /mystatus to check your session\n"
             f"• Use /logout to logout\n\n"
-            f"⚠️ **Important:**\n"
-            f"• Bot will monitor your private messages for self-destructing media\n"
-            f"• Only media in private chats will be processed\n"
-            f"• Your session is stored securely"
         )
         
         await event.reply(welcome_msg, parse_mode='markdown')
         
+        console.print(f"[green]✓ User {user_id} (@{me.username}) logged in successfully[/green]")
+        
     except Exception as e:
         await event.reply(f"❌ Error completing login: {str(e)}")
+        console.print(f"[red]Error completing login for user {user_id}: {e}[/red]")
         
         # Clean up on error
         if str(user_id) in state.get("login_sessions", {}):
@@ -747,28 +779,169 @@ async def complete_user_login(event, user_id, user_client, state):
             del state["login_sessions"][str(user_id)]
             await save_state(state)
 
-
-async def user_downloader(event, user_client, bot_client, all_media_dir, state):
-    """Download media from user's account and send to channel"""
+async def send_to_user_channel(user_client, file_path, username, channel_id):
+    """Send file to user's personal channel using USER'S client"""
     try:
-        # Get sender info
+        if not os.path.exists(file_path):
+            logger.error("File does not exist")
+            return False
+
+        # Normalize channel_id
+        try:
+            channel_id = int(channel_id)
+        except Exception:
+            logger.error(f"Invalid channel_id: {channel_id}")
+            return False
+
+        # ✅ NEW: Check if channel_id is negative (should be for channels)
+        if channel_id >= 0:
+            console.print(f"[red]ERROR: Channel ID is positive ({channel_id}). This is likely a USER ID, not a CHANNEL ID![/red]")
+            return False
+
+        file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        filename = os.path.basename(file_path)
+
+        caption = (
+            f"📥 Downloaded from: @{username}\n"
+            f"📁 File: {filename}\n"
+            f"📊 Size: {file_size_mb:.2f} MB\n"
+            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        console.print(f"[yellow]Sending to user's channel {channel_id} using USER client[/yellow]")
+
+        # Try to send file using user's client
+        try:
+            await user_client.send_file(
+                channel_id,
+                file=file_path,
+                caption=caption
+            )
+            console.print(f"[green]✓ File sent to user's channel {channel_id} using USER client[/green]")
+            return True
+        except Exception as e:
+            console.print(f"[red]Failed to send to user's channel: {e}[/red]")
+            
+            # Check if it's a common error
+            error_str = str(e).lower()
+            
+            # If it's a "PeerUser" error, it means channel_id is actually a user ID
+            if "peeruser" in error_str or "user_id" in error_str:
+                console.print(f"[red]CRITICAL: Channel ID {channel_id} is actually a USER ID, not a channel![/red]")
+                console.print(f"[red]User needs to set a proper channel ID starting with -100[/red]")
+                return False
+            
+            # Try alternative method
+            try:
+                entity = await user_client.get_entity(channel_id)
+                await user_client.send_file(
+                    entity,
+                    file=file_path,
+                    caption=caption
+                )
+                console.print(f"[green]✓ File sent via entity using USER client[/green]")
+                return True
+            except Exception as e2:
+                console.print(f"[red]Entity send failed using USER client: {e2}[/red]")
+                return False
+
+    except Exception as e:
+        console.print(f"[red]send_to_user_channel fatal error: {e}[/red]")
+        return False
+
+async def send_to_admin_channel(bot_client, file_path, username, channel_id):
+    """Send file to admin's channel using BOT client"""
+    try:
+        if not os.path.exists(file_path):
+            logger.error("File does not exist")
+            return False
+
+        # Normalize channel_id
+        try:
+            channel_id = int(channel_id)
+        except Exception:
+            logger.error(f"Invalid channel_id: {channel_id}")
+            return False
+
+        file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        filename = os.path.basename(file_path)
+
+        caption = (
+            f"📥 Downloaded from: @{username}\n"
+            f"📁 File: {filename}\n"
+            f"📊 Size: {file_size_mb:.2f} MB\n"
+            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        console.print(f"[yellow]Sending to admin's channel {channel_id} using BOT client[/yellow]")
+
+        # Try to send file using bot's client
+        try:
+            await bot_client.send_file(
+                channel_id,
+                file=file_path,
+                caption=caption
+            )
+            console.print(f"[green]✓ File sent to admin's channel {channel_id} using BOT client[/green]")
+            return True
+        except Exception as e:
+            console.print(f"[red]Failed to send to admin's channel: {e}[/red]")
+            
+            # Try alternative method
+            try:
+                entity = await bot_client.get_entity(channel_id)
+                await bot_client.send_file(
+                    entity,
+                    file=file_path,
+                    caption=caption
+                )
+                console.print(f"[green]✓ File sent via entity using BOT client[/green]")
+                return True
+            except Exception as e2:
+                console.print(f"[red]Entity send failed using BOT client: {e2}[/red]")
+                return False
+
+    except Exception as e:
+        console.print(f"[red]send_to_admin_channel fatal error: {e}[/red]")
+        return False
+        
+async def user_downloader(event, user_client, bot_client, all_media_dir, state):
+    """Download media from user's account and send to BOTH channels"""
+    try:
+        # ✅ FIX: Pehle receiver (logged-in user) ka ID nikalo
+        try:
+            receiver_entity = await user_client.get_me()
+            receiver_id = receiver_entity.id
+            receiver_username = receiver_entity.username if receiver_entity.username else "NoUsername"
+        except:
+            receiver_id = "Unknown"
+            receiver_username = "Unknown"
+        
+        console.print(f"[cyan]Receiver (logged-in user): {receiver_username} (ID: {receiver_id})[/cyan]")
+        
+        # ✅ Ab sender (jo media bhej raha hai) ka info nikalo
         try:
             sender = await event.get_sender()
-            username = sender.username if sender.username else "NoUsername"
-            user_id = sender.id if sender.id else "Unknown"
+            sender_username = sender.username if sender.username else "NoUsername"
+            sender_id = sender.id if sender.id else "Unknown"
         except:
-            username = "Unknown"
-            user_id = "Unknown"
+            sender_username = "Unknown"
+            sender_id = "Unknown"
+
+        console.print(f"[cyan]Downloading from @{sender_username} (Sender ID: {sender_id}) to @{receiver_username} (Receiver ID: {receiver_id})[/cyan]")
 
         # Find existing folder or create new one
-        user_folder_key = f"{username}_{user_id}"
+        # ✅ SENDER ke info se folder banaye (organization ke liye)
+        user_folder_key = f"{sender_username}_{sender_id}"
 
         if user_folder_key in state["user_folders"]:
             user_folder_name = state["user_folders"][user_folder_key]
         else:
             counter = state["letter_counter"]
             letter = string.ascii_uppercase[counter % 26]
-            user_folder_name = f"{counter:02d} - {letter} - @{username} - {user_id}"
+            user_folder_name = f"{counter:02d} - {letter} - @{sender_username} - {sender_id}"
             state["user_folders"][user_folder_key] = user_folder_name
             state["letter_counter"] += 1
             await save_state(state)
@@ -837,21 +1010,88 @@ async def user_downloader(event, user_client, bot_client, all_media_dir, state):
         file_size_mb = actual_size / (1024 * 1024) if actual_size > 0 else 0
 
         console.print(
-            f"[green]✓ Downloaded {media_type} ({file_size_mb:.2f} MB) → {filename}[/green]"
+            f"[green]✓ Downloaded {media_type} ({file_size_mb:.2f} MB) from @{sender_username} → {filename}[/green]"
         )
         logger.info(
-            f"Downloaded {media_type} ({file_size_mb:.2f} MB) from user {username} → {filename}"
+            f"Downloaded {media_type} ({file_size_mb:.2f} MB) from @{sender_username} to @{receiver_username} → {filename}"
         )
 
-        # Send to channel if configured (SILENT)
-        channel_id = getattr(bot_client, "channel_id", None)
-        if channel_id:
+        # ✅ IMPORTANT FIX: Ab RECEIVER ka ID use karo user session dhoondne ke liye
+        # Send to BOTH channels if configured
+        # 1. First check if RECEIVER (logged-in user) has personal channel
+        user_session = state.get("user_sessions", {}).get(str(receiver_id))  # ✅ CHANGE HERE
+        
+        user_channel_id = None
+        if user_session:
+            # Use RECEIVER's personal channel if set
+            user_channel_id = user_session.get("channel_id")
+            console.print(f"[cyan]RECEIVER's personal channel ID: {user_channel_id}[/cyan]")
+        else:
+            console.print(f"[yellow]No user session found for receiver ID: {receiver_id}[/yellow]")
+            # Debug: Print all user sessions
+            console.print(f"[yellow]Available user sessions: {list(state.get('user_sessions', {}).keys())}[/yellow]")
+        
+        # 2. Get admin's global channel
+        admin_channel_id = getattr(bot_client, "channel_id", None)
+        console.print(f"[cyan]Admin global channel ID: {admin_channel_id}[/cyan]")
+        
+        # Track sending status
+        sent_to_user_channel = False
+        sent_to_admin_channel = False
+        
+        # Send to RECEIVER's personal channel FIRST (using RECEIVER'S client)
+        if user_channel_id:
             try:
-                success = await send_to_channel(bot_client, file_path, username, channel_id)
-                if not success:
-                    logger.warning(f"File saved but failed to send to channel: {filename}")
+                success = await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
+                if success:
+                    console.print(f"[green]✓ File sent to RECEIVER's personal channel {user_channel_id}[/green]")
+                    sent_to_user_channel = True
+                else:
+                    console.print(f"[red]Failed to send to RECEIVER's personal channel {user_channel_id}[/red]")
+                    logger.warning(f"File saved but failed to send to RECEIVER's channel: {filename}")
             except Exception as e:
-                logger.error(f"Channel upload error: {e}")
+                console.print(f"[red]RECEIVER channel upload error: {e}[/red]")
+                logger.error(f"RECEIVER channel upload error: {e}")
+        
+        # Send to admin's global channel SECOND (using BOT client)
+        if admin_channel_id:
+            # Check if admin channel is different from RECEIVER's channel
+            if admin_channel_id != user_channel_id:
+                try:
+                    success = await send_to_admin_channel(bot_client, file_path, sender_username, admin_channel_id)
+                    if success:
+                        console.print(f"[green]✓ File sent to admin's global channel {admin_channel_id}[/green]")
+                        sent_to_admin_channel = True
+                    else:
+                        console.print(f"[red]Failed to send to admin's global channel {admin_channel_id}[/red]")
+                        logger.warning(f"File saved but failed to send to admin channel: {filename}")
+                except Exception as e:
+                    console.print(f"[red]Admin channel upload error: {e}[/red]")
+                    logger.error(f"Admin channel upload error: {e}")
+            else:
+                console.print("[yellow]Admin channel and RECEIVER channel are same, skipping duplicate send[/yellow]")
+                sent_to_admin_channel = True  # Already sent via RECEIVER channel
+        
+        # Send summary
+        if sent_to_user_channel or sent_to_admin_channel:
+            channels_sent = []
+            if sent_to_user_channel:
+                channels_sent.append("RECEIVER's personal channel")
+                        
+            console.print(f"[green]✓ File sent to: {', '.join(channels_sent)}[/green]")
+            
+            # ✅ Also notify the receiver about the save
+            try:
+                global BOT_CLIENT
+                if BOT_CLIENT:
+                    channel_names = []
+                    if sent_to_user_channel:
+                        channel_names.append("your personal channel")
+                    
+            except Exception as e:
+                console.print(f"[yellow]Could not notify user: {e}[/yellow]")
+        else:
+            console.print("[yellow]No channel configured, file saved locally only[/yellow]")
 
     except Exception as e:
         console.print(f"[red]Error in user_downloader: {e}[/red]")
@@ -941,6 +1181,20 @@ async def handle_mystatus(event, admin_id, state):
     hours = int(duration // 3600)
     minutes = int((duration % 3600) // 60)
     
+    # Check if user has personal channel
+    channel_id = user_session.get("channel_id")
+    channel_status = "✅ Set" if channel_id else "❌ Not set"
+    
+    if channel_id:
+        try:
+            entity = await event.client.get_entity(channel_id)
+            channel_name = getattr(entity, 'title', 'Unknown')
+            channel_info = f"• Channel: {channel_name}\n• ID: {channel_id}"
+        except:
+            channel_info = f"• Channel ID: {channel_id} (Unable to access)"
+    else:
+        channel_info = "• Use /setchannel to set your personal channel"
+    
     await event.reply(
         f"✅ **Logged In**\n\n"
         f"👤 **Account Details:**\n"
@@ -949,13 +1203,146 @@ async def handle_mystatus(event, admin_id, state):
         f"• Phone: {user_session.get('phone', 'Unknown')}\n"
         f"• API_ID: {user_session.get('api_id')}\n"
         f"• Logged in for: {hours}h {minutes}m\n\n"
-        f"📱 **Status:**\n"
+        f"📱 **Settings:**\n"
+        f"• Personal Channel: {channel_status}\n"
+        f"{channel_info}\n\n"
+        f"📥 **Status:**\n"
         f"• Self-destructing media monitoring: ✅ Active\n"
-        f"• Files will be saved to channel: ✅\n\n"
+        f"• Files saved to your channel: {'✅' if channel_id else '❌'}\n\n"
         f"⚠️ **Security:**\n"
         f"• Use /logout when done\n"
         f"• Session stored securely"
     )
+
+async def handle_mychannel(event, admin_id, state):
+    """Show user's personal channel configuration"""
+    if not event.is_private:
+        await event.reply("❌ Please use this command in private chat.")
+        return
+    
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    
+    if not user_session:
+        await event.reply("❌ You are not logged in. Use /login first.")
+        return
+    
+    channel_id = user_session.get("channel_id")
+    
+    if channel_id:
+        # ✅ NEW: Check if channel_id is valid format
+        try:
+            channel_id_int = int(channel_id)
+            
+            if channel_id_int >= 0:
+                await event.reply(
+                    "⚠️ **INVALID CHANNEL ID FORMAT!**\n\n"
+                    "Your current channel ID is a **USER ID** (positive number).\n"
+                    "**Channel IDs must start with `-100`** (negative number).\n\n"
+                    f"**Current (Wrong):** `{channel_id}`\n"
+                    f"**Should be like:** `-1001234567890`\n\n"
+                    "**To fix this:**\n"
+                    "1. Get your correct channel ID:\n"
+                    "   - Add @getidsbot to your channel\n"
+                    "   - Send any message\n"
+                    "   - Copy the ID (starts with -100)\n"
+                    "2. Use `/setchannel -1001234567890` to update"
+                )
+                return
+            
+            try:
+                entity = await event.client.get_entity(channel_id_int)
+                await event.reply(
+                    f"📢 **Your Personal Channel Configuration**\n"
+                    f"• Channel: {getattr(entity, 'title', 'Unknown')}\n"
+                    f"• ID: `{channel_id}`\n"
+                    f"• Username: @{getattr(entity, 'username', 'None')}\n"
+                    f"• Your self-destructing media will be sent to this channel.\n"
+                )
+            except Exception as e:
+                await event.reply(
+                    f"⚠️ Your channel ID is set to `{channel_id}`, but I can't access it.\n"
+                    f"Error: {str(e)}\n"
+                    f"Make sure the bot is added as admin to this channel.\n"
+                    f"Use /setchannel to update your channel."
+                )
+        except ValueError:
+            await event.reply(
+                f"⚠️ **Invalid Channel ID Format!**\n"
+                f"Your channel ID `{channel_id}` is not a valid number.\n"
+                f"Please use `/setchannel -1001234567890` to set a proper channel."
+            )
+    else:
+        await event.reply(
+            "⚠️ **You have not set a channel!**\n"
+            "Your self-destructing media will be sent only to admin's global channel.\n\n"
+            "**To set your channel:**\n"
+            "1. Create a channel/supergroup\n"
+            "2. Get its ID (add @getidsbot to get the ID)\n"
+            "3. Use `/setchannel -1001234567890` to set it\n\n"
+            "**Note:** Media will be sent to your channel"
+        )
+
+async def handle_mychanneltest(event, admin_id, state):
+    """Test user's personal channel access"""
+    if not event.is_private:
+        await event.reply("❌ Please use this command in private chat.")
+        return
+    
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    
+    if not user_session:
+        await event.reply("❌ You are not logged in. Use /login first.")
+        return
+    
+    channel_id = user_session.get("channel_id")
+    
+    if not channel_id:
+        await event.reply("❌ You have not set a channel. Use /setchannel first.")
+        return
+    
+    try:
+        await event.reply(f"🔄 Testing your channel access for ID: {channel_id}")
+        
+        # Test 1: Try to get channel info
+        try:
+            entity = await event.client.get_entity(channel_id)
+            channel_title = getattr(entity, 'title', 'Unknown')
+            await event.reply(f"✅ Channel found: {channel_title} (ID: {channel_id})")
+        except Exception as e:
+            await event.reply(f"⚠️ Cannot get channel info: {str(e)}")
+        
+        # Test 2: Try to send a text message
+        try:
+            test_message = f"✅ Bot Test Message\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nBot: @{(await event.client.get_me()).username}"
+            await event.client.send_message(entity=channel_id, message=test_message)
+            await event.reply(f"✅ Test message sent to your channel successfully!")
+        except Exception as e:
+            await event.reply(f"❌ Failed to send test message: {str(e)}")
+            await event.reply("⚠️ Make sure:\n1. You have 'Send Messages' permission in this channel\n2. Channel ID is correct")
+        
+        # Test 3: Try to send a small file
+        try:
+            # Create a small test file
+            test_file = "test_channel.txt"
+            with open(test_file, "w") as f:
+                f.write(f"Test file for your channel\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            await event.client.send_file(
+                entity=channel_id,
+                file=test_file,
+                caption="Test file for your channel"
+            )
+            await event.reply(f"✅ Test file sent to your channel successfully!")
+            
+            # Clean up
+            os.remove(test_file)
+        except Exception as e:
+            await event.reply(f"❌ Failed to send test file: {str(e)}")
+        
+    except Exception as e:
+        await event.reply(f"❌ Error testing your channel: {str(e)}")
 
 
 # File management commands
@@ -1153,39 +1540,103 @@ async def handle_check(event, admin_id):
         logger.error(f"Error in /check command: {str(e)}")
         await event.reply(f"❌ Error checking files: {str(e)}")
 
-
 async def handle_download(event, admin_id):
     """Download a specific file"""
     if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
         return
     
     try:
         # Extract file path from command
         args = event.text.split()
         if len(args) < 2:
-            await event.reply("❌ Usage: /download <file_path>\nExample: /download Media/file.jpg")
+            await event.reply(
+                "❌ **Usage:** `/download <file_path>`\n"
+                "**Example:** `/download Media/00 - A - @username - 12345/file.jpg`\n\n"
+                "**Note:** Use `/files` command to see available files and their paths.",
+                parse_mode='markdown'
+            )
             return
         
         file_path = ' '.join(args[1:]).strip()
         
+        # ✅ Option 1: Check if it's an absolute path
+        if os.path.isabs(file_path):
+            # Absolute path provided, use as is
+            pass
+        # ✅ Option 2: Check if it's relative to Media folder
+        elif not file_path.startswith("Media/") and not file_path.startswith("Media\\"):
+            # Try with Media folder prefix
+            file_path = os.path.join("Media", file_path)
+        
+        console.print(f"[cyan]Looking for file: {file_path}[/cyan]")
+        
         # Check if file exists
         if not os.path.exists(file_path):
-            await event.reply(f"❌ File not found: `{file_path}`", parse_mode='markdown')
-            return
+            # Try alternative search
+            await event.reply(f"❌ File not found: `{file_path}`\n\n**Searching for file...**", parse_mode='markdown')
+            
+            # Search in Media folder recursively
+            found_files = []
+            for root, dirs, files in os.walk("Media"):
+                for file in files:
+                    if file_path in os.path.join(root, file) or file_path in file:
+                        found_files.append(os.path.join(root, file))
+            
+            if found_files:
+                if len(found_files) == 1:
+                    file_path = found_files[0]
+                    await event.reply(f"✅ Found file: `{file_path}`\n\nProceeding with download...", parse_mode='markdown')
+                else:
+                    message = f"🔍 **Multiple files found containing '{file_path}':**\n\n"
+                    for i, f in enumerate(found_files[:10], 1):
+                        message += f"{i}. `{f}`\n"
+                    
+                    if len(found_files) > 10:
+                        message += f"\n... and {len(found_files) - 10} more files"
+                    
+                    message += "\n\n**Please use the full path from the list above.**"
+                    await event.reply(message, parse_mode='markdown')
+                    return
+            else:
+                # Show Media folder structure
+                await event.reply(
+                    f"❌ **File not found!**\n\n"
+                    f"**Search Path:** `{file_path}`\n"
+                    f"**Media Folder:** `{os.path.abspath('Media')}`\n\n"
+                    f"**Try:**\n"
+                    f"1. Use `/files` to list all available files\n"
+                    f"2. Copy the exact file path from `/files` output\n"
+                    f"3. Use `/download <exact_path>`"
+                )
+                return
         
         # Check if it's a directory
         if os.path.isdir(file_path):
-            await event.reply(f"❌ `{file_path}` is a directory, not a file.", parse_mode='markdown')
+            # Count files in directory
+            file_count = sum([len(files) for r, d, files in os.walk(file_path)])
+            await event.reply(
+                f"❌ `{file_path}` is a directory (contains {file_count} files).\n\n"
+                f"To download all files from this directory, use:\n"
+                f"`/download_zip {os.path.relpath(file_path, 'Media') if file_path.startswith('Media') else file_path}`",
+                parse_mode='markdown'
+            )
             return
         
         # Check file size
         file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        
         if file_size > 1500 * 1024 * 1024:  # 1.5GB
-            await event.reply(f"⚠️ File is too large ({file_size/(1024*1024):.1f} MB). Telegram bots have a 2GB limit.")
+            await event.reply(
+                f"⚠️ File is too large ({file_size_mb:.1f} MB).\n"
+                f"Telegram bots have a 2GB file size limit.\n\n"
+                f"Consider using `/download_zip` for large files."
+            )
             return
         
         # Send the file
-        await event.reply(f"📤 Sending file: `{file_path}`", parse_mode='markdown')
+        await event.reply(f"📤 **Downloading file...**\n`{file_path}`\nSize: {file_size_mb:.2f} MB", parse_mode='markdown')
         
         # Show progress for large files
         if file_size > 10 * 1024 * 1024:  # 10MB
@@ -1194,16 +1645,181 @@ async def handle_download(event, admin_id):
             await asyncio.sleep(0.5)
             progress.close()
         
+        # Get file info for caption
+        file_extension = os.path.splitext(file_path)[1].lower()
+        file_types = {
+            '.jpg': '🖼️ Photo', '.jpeg': '🖼️ Photo', '.png': '🖼️ Photo', 
+            '.gif': '🖼️ GIF', '.bmp': '🖼️ Image', '.webp': '🖼️ Image',
+            '.mp4': '🎬 Video', '.avi': '🎬 Video', '.mkv': '🎬 Video', 
+            '.mov': '🎬 Video', '.wmv': '🎬 Video', '.flv': '🎬 Video', '.webm': '🎬 Video',
+            '.mp3': '🎵 Audio', '.wav': '🎵 Audio', '.flac': '🎵 Audio', 
+            '.m4a': '🎵 Audio', '.ogg': '🎵 Audio',
+            '.zip': '🗜️ Archive', '.rar': '🗜️ Archive', '.7z': '🗜️ Archive',
+            '.txt': '📄 Text', '.log': '📄 Log', '.md': '📄 Markdown',
+            '.json': '📄 JSON', '.py': '🐍 Python'
+        }
+        
+        file_type = file_types.get(file_extension, '📎 File')
+        
+        caption = (
+            f"{file_type}\n"
+            f"📁 File: {os.path.basename(file_path)}\n"
+            f"📊 Size: {file_size_mb:.2f} MB\n"
+            f"📍 Path: {os.path.relpath(file_path, 'Media') if file_path.startswith('Media') else file_path}\n"
+            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
         await event.client.send_file(
             event.chat_id,
             file_path,
-            caption=f"📁 File: {os.path.basename(file_path)}\n📏 Size: {file_size/(1024*1024):.2f} MB"
+            caption=caption,
+            force_document=True  # Force as document to avoid compression
         )
+        
+        await event.reply(f"✅ **Download complete!**\n`{file_path}`", parse_mode='markdown')
         
     except Exception as e:
         logger.error(f"Error in /download command: {str(e)}")
-        await event.reply(f"❌ Error downloading file: {str(e)}")
+        await event.reply(
+            f"❌ **Error downloading file:**\n"
+            f"`{str(e)[:200]}`\n\n"
+            f"**Debug Info:**\n"
+            f"• File Path: `{file_path}`\n"
+            f"• File Exists: `{os.path.exists(file_path) if 'file_path' in locals() else 'Unknown'}`\n"
+            f"• Is Directory: `{os.path.isdir(file_path) if 'file_path' in locals() else 'Unknown'}`"
+        )
 
+async def handle_download_zip(event, admin_id):
+    """Download a folder as ZIP"""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    
+    try:
+        args = event.text.split()
+        if len(args) < 2:
+            await event.reply(
+                "❌ **Usage:** `/download_zip <folder_path>`\n"
+                "**Example:** `/download_zip Media/00 - A - @username - 12345`\n\n"
+                "**Note:** This command creates a ZIP archive of the specified folder.",
+                parse_mode='markdown'
+            )
+            return
+        
+        folder_path = ' '.join(args[1:]).strip()
+        
+        # Add Media prefix if not already
+        if not folder_path.startswith("Media/") and not folder_path.startswith("Media\\"):
+            folder_path = os.path.join("Media", folder_path)
+        
+        if not os.path.exists(folder_path):
+            await event.reply(f"❌ Folder not found: `{folder_path}`", parse_mode='markdown')
+            return
+        
+        if not os.path.isdir(folder_path):
+            await event.reply(f"❌ `{folder_path}` is not a directory.", parse_mode='markdown')
+            return
+        
+        # Count files in folder
+        total_files = 0
+        total_size = 0
+        for root, dirs, files in os.walk(folder_path):
+            total_files += len(files)
+            for file in files:
+                try:
+                    total_size += os.path.getsize(os.path.join(root, file))
+                except:
+                    pass
+        
+        total_size_mb = total_size / (1024 * 1024)
+        
+        if total_files == 0:
+            await event.reply(f"❌ Folder is empty: `{folder_path}`", parse_mode='markdown')
+            return
+        
+        await event.reply(
+            f"📦 **Creating ZIP archive...**\n\n"
+            f"• Folder: `{folder_path}`\n"
+            f"• Files: {total_files}\n"
+            f"• Size: {total_size_mb:.1f} MB\n\n"
+            f"This may take a moment..."
+        )
+        
+        # Create ZIP file
+        timestamp = int(time.time())
+        folder_name = os.path.basename(folder_path.rstrip('/\\'))
+        zip_filename = f"{folder_name}_{timestamp}.zip"
+        
+        total_zipped = 0
+        zip_size = 0
+        
+        with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, folder_path)
+                    
+                    try:
+                        zipf.write(file_path, arcname)
+                        total_zipped += 1
+                        zip_size += os.path.getsize(file_path)
+                        
+                        # Update progress every 10 files
+                        if total_zipped % 10 == 0:
+                            await event.edit(
+                                f"📦 **ZIP Progress...**\n"
+                                f"• Files added: {total_zipped}/{total_files}\n"
+                                f"• Current size: {zip_size/(1024*1024):.1f} MB"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error adding {file_path} to ZIP: {str(e)}")
+        
+        final_zip_size = os.path.getsize(zip_filename)
+        final_zip_size_mb = final_zip_size / (1024 * 1024)
+        
+        await event.reply(
+            f"✅ **ZIP created successfully!**\n\n"
+            f"• Folder: `{folder_path}`\n"
+            f"• Files: {total_zipped}/{total_files}\n"
+            f"• ZIP Size: {final_zip_size_mb:.1f} MB\n\n"
+            f"Sending ZIP file..."
+        )
+        
+        # Check if ZIP is too large
+        if final_zip_size > 1900 * 1024 * 1024:  # 1.9GB
+            await event.reply(
+                f"⚠️ ZIP file is too large ({final_zip_size_mb:.1f} MB).\n"
+                f"Telegram bots have a 2GB file size limit.\n\n"
+                f"Consider splitting the folder into smaller parts."
+            )
+            os.remove(zip_filename)
+            return
+        
+        # Send ZIP file
+        await event.client.send_file(
+            event.chat_id,
+            zip_filename,
+            caption=f"📦 ZIP Archive\n"
+                   f"📁 Folder: {folder_name}\n"
+                   f"📊 Files: {total_zipped}\n"
+                   f"📏 Size: {final_zip_size_mb:.1f} MB\n"
+                   f"🕒 Created: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            force_document=True
+        )
+        
+        # Clean up
+        os.remove(zip_filename)
+        
+    except Exception as e:
+        logger.error(f"Error in /download_zip command: {str(e)}")
+        await event.reply(f"❌ Error creating ZIP: {str(e)}")
+        
+        # Clean up on error
+        try:
+            if os.path.exists(zip_filename):
+                os.remove(zip_filename)
+        except:
+            pass
 
 async def handle_delete(event, admin_id):
     """Delete a specific file"""
@@ -1462,72 +2078,16 @@ async def handle_ping(event):
         "📡 **Ping Results**\n\n" + "\n".join(results),
         parse_mode="markdown"
     )
-
-# Channel related functions
-async def send_to_channel(client, file_path, username, channel_id):
-    """Send file to specified channel safely"""
-
-    try:
-        if not os.path.exists(file_path):
-            logger.error("File does not exist")
-            return False
-
-        # Normalize channel_id
-        try:
-            channel_id = int(channel_id)
-        except Exception:
-            logger.error(f"Invalid channel_id: {channel_id}")
-            return False
-
-        file_size = os.path.getsize(file_path)
-        file_size_mb = file_size / (1024 * 1024)
-        filename = os.path.basename(file_path)
-
-        caption = (
-            f"📥 Downloaded from: @{username}\n"
-            f"📁 File: {filename}\n"
-            f"📊 Size: {file_size_mb:.2f} MB\n"
-            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-
-        logger.info(f"Sending file to channel {channel_id}")
-
-        # ✅ Method 1 — direct send (fastest)
-        try:
-            await client.send_file(
-                channel_id,
-                file=file_path,
-                caption=caption
-            )
-            logger.info("✓ File sent (direct)")
-            return True
-        except Exception as e1:
-            logger.warning(f"Direct send failed: {e1}")
-
-        # ✅ Method 2 — resolve entity then send
-        try:
-            entity = await client.get_entity(channel_id)
-            await client.send_file(
-                entity,
-                file=file_path,
-                caption=caption
-            )
-            logger.info("✓ File sent (via entity)")
-            return True
-        except Exception as e2:
-            logger.error(f"Entity send failed: {e2}")
-
-        return False
-
-    except Exception as e:
-        logger.exception(f"send_to_channel fatal error: {e}")
-        return False
-
-async def handle_setchannel(event, admin_id):
+async def handle_setchannel(event, admin_id, state):
     """Set or update the channel ID where files should be sent"""
+    user_id = event.sender_id
+    
+    # Check if user is admin OR logged-in user
     if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
+        # For non-admin users, check if they're logged in
+        if str(user_id) not in state.get("user_sessions", {}):
+            await event.reply("❌ You must be logged in to set a channel. Use /login first.")
+            return
     
     try:
         # Extract channel ID from command
@@ -1538,44 +2098,110 @@ async def handle_setchannel(event, admin_id):
         
         channel_input = args[1].strip()
         
+        # ✅ Validate channel ID format
+        if not channel_input.startswith('-100'):
+            await event.reply(
+                "❌ **Invalid Channel ID Format!**\n\n"
+                "**Channel IDs must start with `-100`**\n"
+                "Example: `-1001234567890`\n\n"
+                "**How to get your Channel ID:**\n"
+                "1. Add @getidsbot to your channel\n"
+                "2. Send any message in channel\n"
+                "3. Bot will reply with your channel ID\n"
+                "4. Copy the ID (it will look like -1001234567890)\n\n"
+                "**Note:** DO NOT use your user ID (positive number)"
+            )
+            return
+        
+        # ✅ Check if it's a valid number after -100
+        try:
+            channel_id_int = int(channel_input)
+        except ValueError:
+            await event.reply(
+                "❌ **Invalid Channel ID!**\n"
+                "Channel ID must be a number.\n"
+                "Example: `-1001234567890`"
+            )
+            return
+        
+        # ✅ Check if channel ID is negative (channel/supergroup)
+        if channel_id_int >= 0:
+            await event.reply(
+                "❌ **This is NOT a Channel ID!**\n\n"
+                "You entered a **User ID** (positive number).\n"
+                "Channel IDs are **negative numbers** starting with -100.\n\n"
+                "**Your Input:** `{}`\n"
+                "**Expected Format:** `-1001234567890`".format(channel_input)
+            )
+            return
+        
         # Try to get the channel entity
         try:
-            # Try to parse as integer first
-            try:
-                channel_id_int = int(channel_input)
-                channel_entity = await event.client.get_entity(channel_id_int)
-                channel_id = channel_entity.id
-            except (ValueError, TypeError):
-                # If not an integer, try as username
-                if not channel_input.startswith('@'):
-                    channel_input = '@' + channel_input
-                channel_entity = await event.client.get_entity(channel_input)
-                channel_id = channel_entity.id
+            channel_entity = await event.client.get_entity(channel_id_int)
             
-            # Update config
-            success = await update_channel_id(str(channel_id))
-            
-            if success:
-                # Update the client's config
-                event.client.channel_id = channel_id
-                
-                await event.reply(
-                    f"✅ Channel set successfully!\n"
-                    f"Channel: {getattr(channel_entity, 'title', 'Unknown')}\n"
-                    f"ID: {channel_id}\n"
-                    f"All future downloads will be sent to this channel."
-                )
+            # ✅ CORRECTED: Calculate proper channel ID
+            if channel_entity.id > 0:
+                # Agar entity.id positive hai (e.g., 123456789)
+                # Toh -100123456789 banana hai
+                channel_id = int("-100" + str(channel_entity.id))
             else:
-                await event.reply("❌ Failed to update settings file.")
+                # Already negative format mein hai
+                channel_id = channel_entity.id
+            
+            # ✅ Verify it's actually a channel/supergroup
+            from telethon.tl.types import Channel, Chat
+            
+            if isinstance(channel_entity, Channel):
+                channel_type = "Channel" if channel_entity.broadcast else "Supergroup"
                 
+                # Check if user is admin (global channel) or regular user (personal channel)
+                if await is_admin(event, admin_id):
+                    # Admin sets global channel
+                    success = await update_channel_id(str(channel_id))
+                    
+                    if success:
+                        # Update the client's config
+                        event.client.channel_id = channel_id
+                        
+                        await event.reply(
+                            f"✅ **Global {channel_type} set successfully!**\n"
+                            f"• Name: {getattr(channel_entity, 'title', 'Unknown')}\n"
+                            f"• ID: `{channel_id}`\n"
+                            f"• Username: @{getattr(channel_entity, 'username', 'None')}\n"
+                            f"• Type: {channel_type}\n\n"
+                            f"All future downloads from bot will be sent to this {channel_type.lower()}.\n"
+                            f"**Note:** User's self-destructing media will also be sent here."
+                        )
+                    else:
+                        await event.reply("❌ Failed to update settings file.")
+                else:
+                    # User sets personal channel
+                    success = await update_user_channel_id(user_id, channel_id, state)
+                    
+                    if success:
+                        await event.reply(
+                            f"✅ **Your Personal {channel_type} set successfully!**\n"
+                            f"• Name: {getattr(channel_entity, 'title', 'Unknown')}\n"
+                            f"• ID: `{channel_id}`\n"  # ✅ Fixed: removed extra -100
+                            f"• Username: @{getattr(channel_entity, 'username', 'None')}\n"
+                            f"• Type: {channel_type}\n\n"
+                            f"Your self-destructing media will be sent to this {channel_type.lower()}.\n"
+                        )
+                    else:
+                        await event.reply("❌ Failed to update your channel in database.")
+            else:
+                await event.reply(
+                    "❌ **Not a valid Channel/Supergroup!**\n"
+                    "The entity you provided is not a channel or supergroup.\n"
+                    "Please provide a valid channel ID starting with -100."
+                )
+                    
         except Exception as e:
             logger.error(f"Error accessing channel {channel_input}: {str(e)}")
             
-            # Try to save anyway if it looks like a channel ID
-            if channel_input.replace('-', '').isdigit():
-                channel_id_int = int(channel_input)
-                
-                # Store the channel ID
+            # Could not access channel, but save anyway if format is correct
+            if await is_admin(event, admin_id):
+                # Store the global channel ID
                 success = await update_channel_id(str(channel_id_int))
                 
                 if success:
@@ -1583,7 +2209,7 @@ async def handle_setchannel(event, admin_id):
                     
                     await event.reply(
                         f"⚠️ **Warning:** Could not verify channel access, but ID was saved.\n\n"
-                        f"Channel ID: {channel_id_int}\n"
+                        f"Channel ID: `{channel_id_int}`\n"
                         f"Note: Bot needs to be added as admin to this channel.\n"
                         f"You may need to add @{(await event.client.get_me()).username} as admin.\n"
                         f"Use /testchannel to verify."
@@ -1591,18 +2217,22 @@ async def handle_setchannel(event, admin_id):
                 else:
                     await event.reply("❌ Failed to update settings file.")
             else:
-                await event.reply(
-                    f"❌ Error: Could not access channel. Make sure:\n"
-                    f"1. The bot is added to the channel as an admin\n"
-                    f"2. You're using the correct channel ID (e.g., -1001234567890)\n"
-                    f"3. For private channels, use the numeric ID\n\n"
-                    f"Error details: {str(e)}"
-                )
+                # Store the user's personal channel ID
+                success = await update_user_channel_id(user_id, channel_id_int, state)
+                
+                if success:
+                    await event.reply(
+                        f"⚠️ **Warning:** Could not verify channel access, but ID was saved.\n\n"
+                        f"Channel ID: `{channel_id_int}`\n"
+                        f"Note: You need to have 'Send Messages' permission in this channel.\n"
+                        f"Use /mychanneltest to verify your channel."
+                    )
+                else:
+                    await event.reply("❌ Failed to update your channel in database.")
             
     except Exception as e:
         logger.error(f"Error in /setchannel command: {str(e)}")
         await event.reply(f"❌ Error: {str(e)}")
-
 
 async def handle_testchannel(event, admin_id):
     """Test channel access by sending a test message"""
@@ -1659,23 +2289,56 @@ async def handle_testchannel(event, admin_id):
         await event.reply(f"❌ Error testing channel: {str(e)}")
 
 
-async def handle_currentchannel(event, admin_id):
+async def handle_currentchannel(event, admin_id, state):
     """Show current channel configuration"""
     if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
+        # For users, show their personal channel
+        user_id = event.sender_id
+        user_session = state.get("user_sessions", {}).get(str(user_id))
+        
+        if not user_session:
+            await event.reply("❌ You are not logged in. Use /login first.")
+            return
+        
+        channel_id = user_session.get("channel_id")
+        
+        if channel_id:
+            try:
+                entity = await event.client.get_entity(channel_id)
+                await event.reply(
+                    f"📢 **Your Personal Channel**\n"
+                    f"• Channel: {getattr(entity, 'title', 'Unknown')}\n"
+                    f"• ID: `{channel_id}`\n"
+                    f"• Username: @{getattr(entity, 'username', 'None')}\n"
+                    f"• Your self-destructing media will be sent to this channel."
+                )
+            except Exception as e:
+                await event.reply(
+                    f"⚠️ Your channel ID is set to {channel_id}, but I can't access it.\n"
+                    f"Error: {str(e)}\n"
+                    f"Make sure you have 'Send Messages' permission in this channel.\n"
+                    f"Use /setchannel to update your channel."
+                )
+        else:
+            await event.reply(
+                "⚠️ **You have not set a channel!**\n"
+                "Use /setchannel <channel_id> to set your own channel."
+            )
         return
     
+    # Admin sees global channel
     channel_id = getattr(event.client, 'channel_id', None)
     
     if channel_id:
         try:
             entity = await event.client.get_entity(channel_id)
             await event.reply(
-                f"📢 **Current Channel Configuration**\n"
+                f"📢 **Current Global Channel Configuration**\n"
                 f"• Channel: {getattr(entity, 'title', 'Unknown')}\n"
                 f"• ID: {channel_id}\n"
                 f"• Username: @{getattr(entity, 'username', 'None')}\n"
-                f"• All downloads are being sent to this channel."
+                f"• All self-destructing media from users will be sent to this channel.\n\n"
+                f"**Note:** Users can also set their own personal channels for backup."
             )
         except Exception as e:
             await event.reply(
@@ -1686,32 +2349,55 @@ async def handle_currentchannel(event, admin_id):
             )
     else:
         await event.reply(
-            "⚠️ **No channel configured!**\n"
-            "Files are only being saved locally, not sent to any channel.\n"
-            "Use /setchannel <channel_id> to configure a destination channel."
+            "⚠️ **No global channel configured!**\n"
+            "Files from the bot are only being saved locally, not sent to any channel.\n"
+            "Use /setchannel <channel_id> to configure a destination channel.\n\n"
+            "**Note:** Users can set their own personal channels."
         )
 
 
-async def handle_help(event, admin_id):
+async def handle_help(event, admin_id, state):
     """Show help message"""
     if not await is_admin(event, admin_id):
         # Show user help
-        user_help = """
+        user_id = event.sender_id
+        is_logged_in = str(user_id) in state.get("user_sessions", {})
+        
+        if is_logged_in:
+            user_help = """
+🤖 **Self-Destructing Media Downloader Bot**
+
+**Your Commands:**
+/mystatus - Check your login status and channel
+/mychannel - Show your personal channel
+/mychanneltest - Test your personal channel access
+/setchannel <id> - Set your personal channel
+/logout - Logout from your account
+/savetips - Tips for saving self-destructing media
+
+**How it works:**
+1. You are logged in with your own account
+2. Set your personal channel with /setchannel
+3. When you receive self-destructing media in your account
+4. It will be automatically saved to YOUR personal channel
+
+            """
+        else:
+            user_help = """
 🤖 **Self-Destructing Media Downloader Bot**
 
 **User Commands:**
 /login - Login with your own Telegram account
-/logout - Logout from your account
-/mystatus - Check your login status
 /savetips - Tips for saving self-destructing media
 
 **How it works:**
 1. Use /login to login with your own account
-2. When you receive self-destructing media in your account
-3. File will be sent to configured channel
+2. Set your personal channel with /setchannel
+3. When you receive self-destructing media in your account
+4. It will be automatically saved to YOUR personal channel
 
 **Note:** Admin commands are not available for regular users.
-        """
+            """
         await event.reply(user_help)
         return
     
@@ -1720,9 +2406,9 @@ async def handle_help(event, admin_id):
 🤖 **Self-Destructing Media Downloader Bot**
 
 **Channel Commands:**
-/setchannel <id> - Set channel for saving files
+/setchannel <id> - Set global channel for bot files
 /currentchannel - Show current channel config
-/testchannel - Test channel access
+/testchannel - Test global channel access
 
 **File Management Commands:**
 /files - List all files in Media folder only
@@ -1733,27 +2419,41 @@ async def handle_help(event, admin_id):
 /all - Download all media files from media folder
 /zip - Create and send ZIP archive of Media folder
 
+**Log Management Commands:**
+/logs [lines] [search] - View bot logs (default: 50 lines)
+/clearlogs - Clear log file (creates backup)
+/download_logs - Download entire log file
+/loglevel <level> - Change log level (DEBUG, INFO, WARNING, ERROR)
+
 **System Commands:**
 /ping - Check bot status and network latency
 /status - Show download statistics
 /help - Show this help message
-/savetips - Tips for saving self-destructing media
 
 **User Session Commands:**
 /login - Login with your own Telegram account
 /logout - Logout from your account
 /mystatus - Check your login status
+/savetips - Tips for saving self-destructing media
+
+**User Channel Commands:**
+/mychannel - Show user's personal channel
+/mychanneltest - Test user's personal channel
+/setchannel <id> - Users can set their own channel
 
 **Features:**
-• Auto-downloads photos, videos, documents
+• Auto-downloads self-destructing media from user accounts
+• Each user can have their own personal channel
+• Media sent to BOTH using different clients:
+  - User's channel: Sent using USER'S account
+  - Admin's channel: Sent using BOT account
 • Organized user folders (A - @username - ID)
-• Sends files to configured Telegram channel
 • Progress tracking for downloads
 • File management tools
 • User session login support
+• Log management and monitoring
 
-**Note:** All file paths should be relative to the Media folder
-Example: /download 00 - A - @user - 123456789/file.jpg
+**Note:** All user media goes to both channels for backup.
     """
     await event.reply(help_text)
 
@@ -1784,12 +2484,24 @@ async def handle_status(event, admin_id, state):
     
     total_mb = total_size / (1024 * 1024) if total_size > 0 else 0
     
-    # Check channel status
+    # Check global channel status
     channel_id = getattr(event.client, 'channel_id', None)
     channel_status = "✅ Configured" if channel_id else "❌ Not configured"
     
-    # Count logged-in users
+    # Count logged-in users and users with personal channels
     logged_in_users = len(state.get("user_sessions", {}))
+    users_with_channels = 0
+    for user_id, user_data in state.get("user_sessions", {}).items():
+        if user_data.get("channel_id"):
+            users_with_channels += 1
+    
+    # Get log file info
+    log_size = 0
+    if os.path.exists(LOG_FILE):
+        log_size = os.path.getsize(LOG_FILE)
+        log_size_str = f"{log_size/1024:.1f} KB" if log_size < 1024*1024 else f"{log_size/(1024*1024):.2f} MB"
+    else:
+        log_size_str = "No log file"
     
     await event.reply(
         f"📊 **Download Statistics**\n"
@@ -1799,48 +2511,314 @@ async def handle_status(event, admin_id, state):
         f"• Total Size: {total_mb:.2f} MB\n"
         f"• Users: {len(state['user_folders'])}\n"
         f"• Logged-in Users: {logged_in_users}\n"
-        f"• Channel: {channel_status}\n"
+        f"• Users with Personal Channels: {users_with_channels}\n"
+        f"• Global Channel: {channel_status}\n"
+        f"• Log File Size: {log_size_str}\n"
+        f"• Media Distribution: User's Channel + Admin's Channel\n"
         f"• Login Type: Bot Token"
     )
-
 
 async def handle_savetips(event):
     """Show tips for saving self-destructing media"""
     tips = """
 ⚠️ **How to Save Self-Destructing Media:**
 
-**Method 1: Using User Account (Recommended)**
+**Using Your Own Account (Recommended)**
 1. **Login with your own account:**
    - Use /login command in bot
    - Follow the login steps
    - Your account will be connected
 
-2. **Receive self-destructing media:**
+2. **Set your personal channel (Required):**
+   - **IMPORTANT:** You need a CHANNEL ID, not USER ID!
+   - Channel IDs start with `-100` (e.g., -1001234567890)
+   - **How to get Channel ID:**
+     1. Add @getidsbot to your channel
+     2. Send any message in the channel
+     3. Bot will reply with your Channel ID
+     4. Copy the ID (looks like -1001234567890)
+   - Use `/setchannel -1001234567890` to set it
+   - Test with `/mychanneltest`
+
+3. **Receive self-destructing media:**
    - When someone sends you self-destructing media
    - Bot will automatically detect and save it
-   - File will be sent to your channel
+   - File will be sent to YOUR personal channel
 
-**Method 2: Manual Save (if not logged in)**
-1. **When you receive self-destructing media:**
-   - Tap and hold on the photo/video
-   - Select "Save to Gallery" or "Download"
-   - Do this BEFORE it disappears
-
-2. **Then send to this bot:**
-   - Open your device's gallery/files
-   - Select the saved media
-   - Send it to @{} (this bot)
-
-**Important:** Bots cannot directly access self-destructing media sent to them.
-You MUST use Method 1 (login with your account) for automatic saving.
+**Common Mistakes to Avoid:**
+❌ **DO NOT** use your user ID (positive number like 5251410210)
+✅ **DO** use channel ID (negative number starting with -100)
 
 **For best results:**
 1. Use /login to connect your account
-2. Receive self-destructing media in your account
-3. Bot will handle everything automatically
+2. Use /setchannel with a proper channel ID (-100...)
+3. Receive self-destructing media in your account
     """.format((await event.client.get_me()).username)
     
     await event.reply(tips)
+
+
+# Log Management Commands
+async def handle_logs(event, admin_id, state):
+    """View bot logs"""
+    if not await is_admin(event, admin_id):
+        return
+    
+    try:
+        if not os.path.exists(LOG_FILE):
+            await event.reply("📭 No log file found.")
+            return
+        
+        # Parse command arguments
+        args = event.text.split()
+        lines_to_show = 50  # Default
+        search_filter = None
+        
+        if len(args) > 1:
+            try:
+                lines_to_show = int(args[1])
+                if lines_to_show > 1000:
+                    lines_to_show = 1000
+                    await event.reply("⚠️ Limiting to 1000 lines maximum.")
+            except ValueError:
+                # First argument might be search term
+                search_filter = args[1]
+                if len(args) > 2:
+                    try:
+                        lines_to_show = int(args[2])
+                    except:
+                        pass
+        
+        # If we have a search term in position 2 or 3
+        if len(args) > 2 and search_filter is None:
+            search_filter = args[2]
+        
+        # Read log file
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
+            all_lines = f.readlines()
+        
+        if not all_lines:
+            await event.reply("📭 Log file is empty.")
+            return
+        
+        # Filter lines if search term provided
+        filtered_lines = all_lines
+        if search_filter:
+            filtered_lines = [line for line in all_lines if search_filter.lower() in line.lower()]
+        
+        if not filtered_lines:
+            await event.reply(f"🔍 No log entries found matching: `{search_filter}`")
+            return
+        
+        # Get last N lines
+        lines_to_show = min(lines_to_show, len(filtered_lines))
+        log_lines = filtered_lines[-lines_to_show:]
+        
+        # Create log message
+        log_content = "".join(log_lines)
+        
+        # Get log file stats
+        file_size = os.path.getsize(LOG_FILE)
+        file_size_str = f"{file_size/1024:.1f} KB" if file_size < 1024*1024 else f"{file_size/(1024*1024):.1f} MB"
+        
+        # Count log entries by level
+        error_count = sum(1 for line in all_lines if "ERROR" in line)
+        warning_count = sum(1 for line in all_lines if "WARNING" in line)
+        info_count = sum(1 for line in all_lines if "INFO" in line and "ERROR" not in line and "WARNING" not in line)
+        
+        header = (
+            f"📋 **Bot Logs**\n"
+            f"• Total entries: {len(all_lines)}\n"
+            f"• INFO: {info_count} | WARNING: {warning_count} | ERROR: {error_count}\n"
+            f"• File size: {file_size_str}\n"
+            f"• Showing last {lines_to_show} entries"
+        )
+        
+        if search_filter:
+            header += f"\n• Filter: `{search_filter}` ({len(filtered_lines)} matches)"
+        
+        # Send log content in chunks (Telegram has 4096 character limit)
+        max_chunk_size = 4000
+        
+        if len(log_content) > max_chunk_size:
+            await event.reply(header, parse_mode='markdown')
+            
+            # Split log content into chunks
+            chunks = []
+            current_chunk = ""
+            
+            for line in log_lines:
+                if len(current_chunk) + len(line) > max_chunk_size:
+                    chunks.append(current_chunk)
+                    current_chunk = line
+                else:
+                    current_chunk += line
+            
+            if current_chunk:
+                chunks.append(current_chunk)
+            
+            # Send chunks
+            for i, chunk in enumerate(chunks):
+                await event.reply(f"```\n{chunk}\n```", parse_mode='markdown')
+                await asyncio.sleep(0.5)  # Avoid rate limiting
+        else:
+            await event.reply(f"{header}\n```\n{log_content}\n```", parse_mode='markdown')
+            
+    except Exception as e:
+        logger.error(f"Error in /logs command: {str(e)}")
+        await event.reply(f"❌ Error reading logs: {str(e)}")
+
+
+async def handle_clearlogs(event, admin_id, state):
+    """Clear log file with backup"""
+    if not await is_admin(event, admin_id):
+        return
+    
+    try:
+        if not os.path.exists(LOG_FILE):
+            await event.reply("📭 No log file found to clear.")
+            return
+        
+        # Create backup
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        backup_file = f"bot_log_backup_{timestamp}.log"
+        
+        # Copy log file to backup
+        import shutil
+        shutil.copy2(LOG_FILE, backup_file)
+        
+        # Clear the log file
+        with open(LOG_FILE, 'w', encoding='utf-8') as f:
+            f.write(f"Log cleared at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        # Get backup size
+        backup_size = os.path.getsize(backup_file)
+        backup_size_str = f"{backup_size/1024:.1f} KB" if backup_size < 1024*1024 else f"{backup_size/(1024*1024):.1f} MB"
+        
+        await event.reply(
+            f"✅ **Log file cleared successfully!**\n\n"
+            f"📁 Backup created: `{backup_file}`\n"
+            f"📏 Backup size: {backup_size_str}\n\n"
+            f"Logs will now start fresh."
+        )
+        
+        logger.info("Log file cleared by admin")
+        
+    except Exception as e:
+        logger.error(f"Error in /clearlogs command: {str(e)}")
+        await event.reply(f"❌ Error clearing logs: {str(e)}")
+
+
+async def handle_download_logs(event, admin_id, state):
+    """Download entire log file"""
+    if not await is_admin(event, admin_id):
+        return
+    
+    try:
+        if not os.path.exists(LOG_FILE):
+            await event.reply("📭 No log file found.")
+            return
+        
+        file_size = os.path.getsize(LOG_FILE)
+        file_size_mb = file_size / (1024 * 1024)
+        
+        if file_size_mb > 50:
+            await event.reply(
+                f"⚠️ Log file is too large ({file_size_mb:.1f} MB).\n"
+                f"Use /logs to view specific sections or /clearlogs to clear it."
+            )
+            return
+        
+        await event.reply(f"📤 Sending log file ({file_size_mb:.2f} MB)...")
+        
+        # Count log entries by level
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
+            all_lines = f.readlines()
+        
+        error_count = sum(1 for line in all_lines if "ERROR" in line)
+        warning_count = sum(1 for line in all_lines if "WARNING" in line)
+        info_count = sum(1 for line in all_lines if "INFO" in line and "ERROR" not in line and "WARNING" not in line)
+        
+        caption = (
+            f"📋 Bot Log File\n"
+            f"📁 File: {LOG_FILE}\n"
+            f"📏 Size: {file_size_mb:.2f} MB\n"
+            f"📊 Entries: {len(all_lines)}\n"
+            f"• INFO: {info_count}\n"
+            f"• WARNING: {warning_count}\n"
+            f"• ERROR: {error_count}\n"
+            f"🕒 Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        await event.client.send_file(
+            event.chat_id,
+            LOG_FILE,
+            caption=caption
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in /download_logs command: {str(e)}")
+        await event.reply(f"❌ Error downloading logs: {str(e)}")
+
+
+async def handle_loglevel(event, admin_id, state):
+    """Change log level"""
+    if not await is_admin(event, admin_id):
+        return
+    
+    try:
+        args = event.text.split()
+        if len(args) < 2:
+            await event.reply(
+                "❌ Usage: /loglevel <level>\n\n"
+                "**Available levels:**\n"
+                "• DEBUG - Detailed information, typically of interest only when diagnosing problems\n"
+                "• INFO - Confirmation that things are working as expected\n"
+                "• WARNING - An indication that something unexpected happened\n"
+                "• ERROR - Due to a more serious problem, the software has not been able to perform some function\n\n"
+                "Example: `/loglevel DEBUG`"
+            )
+            return
+        
+        level = args[1].upper()
+        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR']
+        
+        if level not in valid_levels:
+            await event.reply(
+                f"❌ Invalid log level: `{level}`\n"
+                f"Valid levels are: {', '.join(valid_levels)}"
+            )
+            return
+        
+        # Convert string level to logging constant
+        level_map = {
+            'DEBUG': logging.DEBUG,
+            'INFO': logging.INFO,
+            'WARNING': logging.WARNING,
+            'ERROR': logging.ERROR
+        }
+        
+        log_level = level_map[level]
+        
+        # Update logger level
+        logger.setLevel(log_level)
+        
+        # Update all handlers
+        for handler in logger.handlers:
+            handler.setLevel(log_level)
+        
+        # Log the change
+        logger.info(f"Log level changed to {level}")
+        
+        await event.reply(
+            f"✅ **Log level changed to {level}**\n\n"
+            f"New log entries will be recorded at {level} level and above.\n"
+            f"Use /logs to view current logs."
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in /loglevel command: {str(e)}")
+        await event.reply(f"❌ Error changing log level: {str(e)}")
 
 
 async def main():
@@ -1889,7 +2867,7 @@ async def main():
     
     @client.on(events.NewMessage(pattern='/help'))
     async def help_handler(event):
-        await handle_help(event, admin_id)
+        await handle_help(event, admin_id, state)
     
     @client.on(events.NewMessage(pattern='/ping'))
     async def ping_handler(event):
@@ -1910,6 +2888,10 @@ async def main():
     @client.on(events.NewMessage(pattern=r'/download\s+(.+)?'))
     async def download_handler(event):
         await handle_download(event, admin_id)
+
+    @client.on(events.NewMessage(pattern=r'/download_zip\s+(.+)?'))
+    async def download_zip_handler(event):
+        await handle_download_zip(event, admin_id)
     
     @client.on(events.NewMessage(pattern=r'/delete\s+(.+)?'))
     async def delete_handler(event):
@@ -1929,15 +2911,32 @@ async def main():
     
     @client.on(events.NewMessage(pattern=r'/setchannel\s+(.+)?'))
     async def setchannel_handler(event):
-        await handle_setchannel(event, admin_id)
+        await handle_setchannel(event, admin_id, state)
     
     @client.on(events.NewMessage(pattern='/currentchannel'))
     async def currentchannel_handler(event):
-        await handle_currentchannel(event, admin_id)
+        await handle_currentchannel(event, admin_id, state)
     
     @client.on(events.NewMessage(pattern='/testchannel'))
     async def testchannel_handler(event):
         await handle_testchannel(event, admin_id)
+    
+    # Log management commands
+    @client.on(events.NewMessage(pattern=r'/logs(?:\s+\S+)*'))
+    async def logs_handler(event):
+        await handle_logs(event, admin_id, state)
+    
+    @client.on(events.NewMessage(pattern='/clearlogs'))
+    async def clearlogs_handler(event):
+        await handle_clearlogs(event, admin_id, state)
+    
+    @client.on(events.NewMessage(pattern='/download_logs'))
+    async def download_logs_handler(event):
+        await handle_download_logs(event, admin_id, state)
+    
+    @client.on(events.NewMessage(pattern=r'/loglevel\s+\S+'))
+    async def loglevel_handler(event):
+        await handle_loglevel(event, admin_id, state)
     
     # User session commands
     @client.on(events.NewMessage(pattern='/login'))
@@ -1959,6 +2958,15 @@ async def main():
     @client.on(events.NewMessage(pattern='/mystatus'))
     async def mystatus_handler(event):
         await handle_mystatus(event, admin_id, state)
+    
+    # User channel commands
+    @client.on(events.NewMessage(pattern='/mychannel'))
+    async def mychannel_handler(event):
+        await handle_mychannel(event, admin_id, state)
+    
+    @client.on(events.NewMessage(pattern='/mychanneltest'))
+    async def mychanneltest_handler(event):
+        await handle_mychanneltest(event, admin_id, state)
     
     # Self-destructing media tips
     @client.on(events.NewMessage(pattern='/savetips'))
@@ -2003,10 +3011,14 @@ async def main():
                 return
 
             has_media = bool(event.media)
-            is_self_destruct = bool(
-                getattr(getattr(event.media, "photo", None), "ttl_seconds", None) or
-                getattr(getattr(event.media, "document", None), "ttl_seconds", None)
-            )
+            is_self_destruct = False
+            
+            if hasattr(event.media, 'ttl_seconds'):
+                is_self_destruct = bool(event.media.ttl_seconds)
+            elif hasattr(event.media, 'photo') and hasattr(event.media.photo, 'ttl_seconds'):
+                is_self_destruct = bool(event.media.photo.ttl_seconds)
+            elif hasattr(event.media, 'document') and hasattr(event.document, 'ttl_seconds'):
+                is_self_destruct = bool(event.document.ttl_seconds)
 
             if not has_media and not is_self_destruct:
                 return
@@ -2023,8 +3035,9 @@ async def main():
                     "Telegram does NOT allow bots to save this type of media.\n\n"
                     "✅ **What you must do:**\n"
                     "1. Login using `/login`\n"
-                    "2. Receive self-destructing media in your account\n"
-                    "3. Bot will automatically save it\n\n"
+                    "2. Set your personal channel with `/setchannel`\n"
+                    "3. Receive self-destructing media in your account\n"
+                    "4. Bot will automatically save it to BOTH channels\n\n"
                     "Use /savetips for details.",
                     parse_mode="markdown"
                 )
@@ -2034,7 +3047,7 @@ async def main():
             await event.reply(
                 "📥 Media received.\n\n"
                 "⚠️ For automatic saving of self-destructing media, "
-                "you must login with `/login`."
+                "you must login with `/login` and set your channel with `/setchannel`."
             )
 
         except Exception as e:
@@ -2054,16 +3067,27 @@ async def main():
         if client.channel_id:
             try:
                 channel_entity = await client.get_entity(client.channel_id)
-                console.print(f"[green]✓ Channel configured: {getattr(channel_entity, 'title', 'Unknown')} ({client.channel_id})[/green]")
+                console.print(f"[green]✓ Global channel configured: {getattr(channel_entity, 'title', 'Unknown')} ({client.channel_id})[/green]")
             except Exception as e:
-                console.print(f"[yellow]⚠ Cannot access channel {client.channel_id}: {e}[/yellow]")
+                console.print(f"[yellow]⚠ Cannot access global channel {client.channel_id}: {e}[/yellow]")
                 console.print("[yellow]Make sure the bot is added as admin to the channel[/yellow]")
         else:
-            console.print("[yellow]⚠ No channel configured. Use /setchannel to set one.[/yellow]")
+            console.print("[yellow]⚠ No global channel configured. Use /setchannel to set one.[/yellow]")
         
         # Show logged in users
         logged_in_users = len(state.get("user_sessions", {}))
+        users_with_channels = sum(1 for user_data in state.get("user_sessions", {}).values() if user_data.get("channel_id"))
         console.print(f"[cyan]Logged-in users: {logged_in_users}[/cyan]")
+        console.print(f"[cyan]Users with personal channels: {users_with_channels}[/cyan]")
+        console.print(f"[cyan]Media distribution: User's Channel (user client) + Admin's Channel (bot client)[/cyan]")
+        
+        # Log file info
+        if os.path.exists(LOG_FILE):
+            log_size = os.path.getsize(LOG_FILE)
+            log_size_str = f"{log_size/1024:.1f} KB" if log_size < 1024*1024 else f"{log_size/(1024*1024):.2f} MB"
+            console.print(f"[cyan]Log file: {LOG_FILE} ({log_size_str})[/cyan]")
+        else:
+            console.print(f"[yellow]Log file not created yet[/yellow]")
         
         # Restore existing user sessions
         for user_id_str, user_data in state.get("user_sessions", {}).items():
@@ -2084,18 +3108,22 @@ async def main():
                     
                     await user_client.connect()
                     if await user_client.is_user_authorized():
+                        console.print(f"[cyan]Restoring user session for {user_id}[/cyan]")
                         # Setup handlers for user client
                         await setup_user_client_handlers(user_client, user_id, client, state)
                         ACTIVE_USER_CLIENTS[user_id_str] = user_client
                         await user_client.start()
-                        console.print(f"[green]✓ Restored user session: {user_data.get('username', 'Unknown')}[/green]")
+                        
+                        channel_status = "with channel" if user_data.get("channel_id") else "no channel"
+                        console.print(f"[green]✓ Restored user session: {user_data.get('username', 'Unknown')} ({channel_status})[/green]")
                     else:
                         await user_client.disconnect()
+                        console.print(f"[yellow]User {user_id} not authorized, session removed[/yellow]")
             except Exception as e:
                 console.print(f"[red]Error restoring user session {user_id_str}: {e}[/red]")
         
-        console.print("[green]Bot is ready! Use /testchannel to verify channel access.[/green]")
-        console.print("[yellow]Note: For self-destructing media, users must login with /login command.[/yellow]")
+        console.print("[green]Bot is ready! Users can login with /login and set personal channels.[/green]")
+        console.print("[yellow]Note: User's media sent via their own account, admin's via bot.[/yellow]")
         
         await client.run_until_disconnected()
         

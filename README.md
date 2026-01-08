@@ -117,8 +117,6 @@ cd Self-Destructing-Media-Downloader
 pip install -r requirements.txt
 python main.py
 
----
-
 ```
 ## 🔐 Security Notes
 

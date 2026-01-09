@@ -108,6 +108,15 @@ This project uses:
 
 ---
 
+## Variables
+
+### Required Variables
+* <b>`BOT_TOKEN`: Create a bot using [@BotFather](https://telegram.dog/BotFather), and get the Telegram API token.
+* `API_ID`: Get this value from [telegram.org](https://my.telegram.org/apps)
+* `API_HASH`: Get this value from [telegram.org](https://my.telegram.org/apps)
+* `CHANNELS`: ID of channel
+* `ADMINS`: ID of Admin. </b>
+
 ## 📦 Installation
 
 ### 1️⃣ Clone repository

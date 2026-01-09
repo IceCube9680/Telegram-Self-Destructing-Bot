@@ -658,6 +658,10 @@ async def setup_user_client_handlers(user_client, user_id, bot_client, state):
             if event.out:
                 return
 
+            # 🚫 Ignore non-private chats
+            if not event.is_private:
+                return
+
             # 🚫 Ignore messages without media
             if not event.media:
                 return
@@ -673,15 +677,21 @@ async def setup_user_client_handlers(user_client, user_id, bot_client, state):
                     ttl = msg.media.photo.ttl_seconds
                 elif hasattr(msg.media, 'document') and hasattr(msg.media.document, 'ttl_seconds'):
                     ttl = msg.media.document.ttl_seconds
+                elif hasattr(msg.media, 'video') and hasattr(msg.media.video, 'ttl_seconds'):
+                    ttl = msg.media.video.ttl_seconds
+                elif hasattr(msg.media, 'video_note') and hasattr(msg.media.video_note, 'ttl_seconds'):
+                    ttl = msg.media.video_note.ttl_seconds
+                elif hasattr(msg.media, 'voice') and hasattr(msg.media.voice, 'ttl_seconds'):
+                    ttl = msg.media.voice.ttl_seconds
+                elif hasattr(msg.media, 'audio') and hasattr(msg.media.audio, 'ttl_seconds'):
+                    ttl = msg.media.audio.ttl_seconds
 
-            console.print(f"[cyan]User {user_id} received media, TTL: {ttl}[/cyan]")
-
-            # ❌ Ignore normal media (no TTL)
+            # ❌ Ignore normal media (no TTL) - SILENTLY
             if not ttl:
-                console.print(f"[yellow]Normal media ignored for user {user_id}[/yellow]")
-                return
+                return  # ✅ No console print, just return
 
-            console.print(f"[green]Self-destructing media detected for user {user_id} (TTL: {ttl}s)[/green]")
+            # ✅ Only log self-destructing media
+            console.print(f"[green]⚠️ Self-destructing media detected for user {user_id} (TTL: {ttl}s)[/green]")
             
             # ✅ Download immediately
             await user_downloader(
@@ -692,10 +702,14 @@ async def setup_user_client_handlers(user_client, user_id, bot_client, state):
                 state
             )
 
-            console.print(f"[magenta]Media saved for user {user_id}[/magenta]")
+            console.print(f"[magenta]✅ Media saved for user {user_id}[/magenta]")
+            
+            # ✅ Log the successful save
+            logger.info(f"User {user_id} saved self-destructing media (TTL: {ttl}s)")
 
         except Exception as e:
-            console.print(f"[red]Error in user media handler for {user_id}: {e}[/red]")
+            # Only log actual errors
+            console.print(f"[red]❌ Error in user media handler for {user_id}: {e}[/red]")
             logger.error(f"User media handler error for {user_id}: {e}")
 
 
@@ -3123,7 +3137,7 @@ async def main():
                 console.print(f"[red]Error restoring user session {user_id_str}: {e}[/red]")
         
         console.print("[green]Bot is ready! Users can login with /login and set personal channels.[/green]")
-        console.print("[yellow]Note: User's media sent via their own account, admin's via bot.[/yellow]")
+#        console.print("[yellow]Note: User's media sent via their own account, admin's via bot.[/yellow]")
         
         await client.run_until_disconnected()
         

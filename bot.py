@@ -2240,6 +2240,11 @@ async def handle_mychanneltest(event, admin_id, state):
 # ===== NEW COMMAND HANDLERS FROM FILE 2 =====
 async def handle_checkmissed(event, admin_id, state):
     """Handle /checkmissed command - Check for missed self-destructing media in last 48 hours"""
+    # REMOVE the admin check from here since we're handling it in enhanced version
+    # if not await is_admin(event, admin_id):
+    #     await event.reply("❌ You are not authorized to use this command.")
+    #     return
+    
     if not event.is_private:
         await event.reply("❌ Please use this command in private chat.")
         return
@@ -3985,6 +3990,227 @@ async def handle_download_logs(event, admin_id, state):
         logger.error(f"Error in /download_logs command: {str(e)}")
         await event.reply(f"❌ Error downloading logs: {str(e)}")
 
+# ===== NEW ADMIN MANAGEMENT COMMANDS =====
+async def handle_users(event, admin_id, state):
+    """Show all logged-in users (Admin only)"""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    
+    user_sessions = state.get("user_sessions", {})
+    
+    if not user_sessions:
+        await event.reply("📭 No users are currently logged in.")
+        return
+    
+    message = "👥 **Logged-in Users:**\n\n"
+    
+    for user_id_str, user_data in user_sessions.items():
+        user_id = int(user_id_str)
+        username = user_data.get('username', 'No username')
+        first_name = user_data.get('first_name', 'Unknown')
+        phone = user_data.get('phone', 'No phone')
+        has_channel = "✅" if user_data.get('channel_id') else "❌"
+        login_time = user_data.get('login_time', time.time())
+        
+        # Calculate login duration
+        duration = time.time() - login_time
+        hours = int(duration // 3600)
+        minutes = int((duration % 3600) // 60)
+        
+        # Get queue stats for this user
+        try:
+            queue_stats = await MEDIA_QUEUE.get_queue_stats()
+            pending_count = queue_stats.get('pending_by_user', {}).get(user_id_str, 0)
+        except:
+            pending_count = 0
+        
+        message += (
+            f"**User ID:** `{user_id}`\n"
+            f"• Name: {first_name}\n"
+            f"• Username: @{username}\n"
+            f"• Phone: {phone}\n"
+            f"• Personal Channel: {has_channel}\n"
+            f"• Pending Media: {pending_count}\n"
+            f"• Logged in: {hours}h {minutes}m\n"
+            f"• Check missed: `/checkmissed {user_id}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+    
+    message += f"**Total Users:** {len(user_sessions)}\n"
+    message += "**Commands:**\n• Check all: `/checkmissed_all`\n• Check specific: `/checkmissed <user_id>`"
+    
+    # Split if too long
+    if len(message) > 4000:
+        chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
+        for i, chunk in enumerate(chunks):
+            await event.reply(f"**Users List (Part {i+1}/{len(chunks)}):**\n{chunk}", parse_mode='markdown')
+    else:
+        await event.reply(message, parse_mode='markdown')
+
+
+async def handle_checkmissed_all(event, admin_id, state):
+    """Admin: Check missed media for ALL logged-in users"""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    
+    user_sessions = state.get("user_sessions", {})
+    
+    if not user_sessions:
+        await event.reply("📭 No users are currently logged in.")
+        return
+    
+    await event.reply(f"🔄 Checking missed media for ALL {len(user_sessions)} users... This may take a while.")
+    
+    total_found_all = 0
+    results = []
+    
+    for user_id_str, user_data in user_sessions.items():
+        user_id = int(user_id_str)
+        username = user_data.get('username', f'User {user_id}')
+        
+        try:
+            # Load user client
+            user_session_file = get_user_session_file(user_id)
+            if not os.path.exists(user_session_file):
+                results.append(f"❌ {username}: Session file not found")
+                continue
+            
+            async with aiofiles.open(user_session_file, mode="r") as f:
+                session_string = await f.read()
+            
+            session = StringSession(session_string)
+            user_client = TelegramClient(session, user_data["api_id"], user_data["api_hash"])
+            
+            await user_client.connect()
+            
+            if await user_client.is_user_authorized():
+                console.print(f"[cyan]Checking missed media for user {user_id} (@{username})[/cyan]")
+                
+                found_count = await check_missed_media(user_id, user_client, state)
+                total_found_all += found_count
+                
+                results.append(f"✅ {username}: Found {found_count} missed media")
+                
+                await user_client.disconnect()
+                await asyncio.sleep(2)  # Delay between users
+            else:
+                results.append(f"❌ {username}: Not authorized")
+                await user_client.disconnect()
+                
+        except Exception as e:
+            results.append(f"❌ {username}: Error - {str(e)[:50]}")
+            console.print(f"[red]Error checking user {user_id}: {e}[/red]")
+    
+    # Send summary
+    summary = (
+        f"📊 **Missed Media Check - COMPLETED**\n\n"
+        f"**Total Users Checked:** {len(user_sessions)}\n"
+        f"**Total Missed Media Found:** {total_found_all}\n\n"
+        f"**Results:**\n" + "\n".join(results) + "\n\n"
+        f"**Queue Status:** Use `/queue_stats` to see pending items.\n"
+        f"**Process Queue:** Use `/process_queue` to process them."
+    )
+    
+    # Split if too long
+    if len(summary) > 4000:
+        chunks = [summary[i:i+4000] for i in range(0, len(summary), 4000)]
+        for i, chunk in enumerate(chunks):
+            await event.reply(f"**Results (Part {i+1}/{len(chunks)}):**\n{chunk}", parse_mode='markdown')
+    else:
+        await event.reply(summary, parse_mode='markdown')
+
+
+async def handle_checkmissed_enhanced(event, admin_id, state):
+    """Enhanced checkmissed command for both users and admin"""
+    
+    args = event.text.split()
+    
+    # If user is not admin and trying to check other user
+    if not await is_admin(event, admin_id) and len(args) > 1:
+        await event.reply("❌ You can only check your own missed media.")
+        return
+    
+    # USER: Check own missed media (no arguments or just /checkmissed)
+    if len(args) == 1 or (len(args) == 2 and args[1].isdigit() and not await is_admin(event, admin_id)):
+        await handle_checkmissed(event, admin_id, state)
+        return
+    
+    # ADMIN: Check specific user
+    if len(args) == 2:
+        if args[1].lower() == 'all':
+            await handle_checkmissed_all(event, admin_id, state)
+            return
+        elif args[1].isdigit():
+            user_id_to_check = int(args[1])
+            await handle_checkmissed_user(event, admin_id, state, user_id_to_check)
+            return
+    
+    await event.reply(
+        "❌ **Usage:**\n\n"
+        "**For Users:**\n"
+        "• `/checkmissed` - Check your own missed media\n\n"
+        "**For Admin:**\n"
+        "• `/checkmissed <user_id>` - Check specific user\n"
+        "• `/checkmissed all` - Check all users\n"
+        "• `/users` - List all logged-in users\n"
+        "• `/checkmissed_all` - Check all users (alternative)"
+    )
+
+
+async def handle_checkmissed_user(event, admin_id, state, target_user_id):
+    """Admin: Check missed media for specific user"""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ Admin only command.")
+        return
+    
+    user_sessions = state.get("user_sessions", {})
+    target_user_str = str(target_user_id)
+    
+    if target_user_str not in user_sessions:
+        await event.reply(f"❌ User {target_user_id} is not logged in.")
+        return
+    
+    user_data = user_sessions[target_user_str]
+    username = user_data.get('username', f'User {target_user_id}')
+    
+    await event.reply(f"🔄 Checking missed media for user {target_user_id} (@{username})...")
+    
+    try:
+        # Load user client
+        user_session_file = get_user_session_file(target_user_id)
+        if not os.path.exists(user_session_file):
+            await event.reply(f"❌ Session file not found for user {target_user_id}")
+            return
+        
+        async with aiofiles.open(user_session_file, mode="r") as f:
+            session_string = await f.read()
+        
+        session = StringSession(session_string)
+        user_client = TelegramClient(session, user_data["api_id"], user_data["api_hash"])
+        
+        await user_client.connect()
+        
+        if await user_client.is_user_authorized():
+            found_count = await check_missed_media(target_user_id, user_client, state)
+            
+            await user_client.disconnect()
+            
+            await event.reply(
+                f"✅ **Missed Media Check Complete**\n\n"
+                f"**User:** @{username} (ID: {target_user_id})\n"
+                f"**Found:** {found_count} missed media items\n\n"
+                f"**Status:** {'Queued for processing' if found_count > 0 else 'No missed media found'}\n"
+                f"**Queue:** Use `/queue_stats` to see pending items"
+            )
+        else:
+            await user_client.disconnect()
+            await event.reply(f"❌ User {target_user_id} is not authorized.")
+            
+    except Exception as e:
+        await event.reply(f"❌ Error checking user {target_user_id}: {str(e)}")
+
 
 async def handle_loglevel(event, admin_id, state):
     """Change log level"""
@@ -4209,11 +4435,20 @@ async def main():
     @client.on(events.NewMessage(pattern='/savetips'))
     async def savetips_handler(event):
         await handle_savetips(event)
+
+    # ===== ENHANCED /checkmissed COMMAND =====
+    @client.on(events.NewMessage(pattern=r'^/checkmissed(?:\s+\S+)?$'))
+    async def checkmissed_enhanced_handler(event):
+        await handle_checkmissed_enhanced(event, admin_id, state)
     
-    # ===== NEW COMMAND HANDLERS =====
-    @client.on(events.NewMessage(pattern=r'^/checkmissed$'))
-    async def checkmissed_handler(event):
-        await handle_checkmissed(event, admin_id, state)
+    # ===== ADMIN USER MANAGEMENT COMMANDS =====
+    @client.on(events.NewMessage(pattern='/users'))
+    async def users_handler(event):
+        await handle_users(event, admin_id, state)
+    
+    @client.on(events.NewMessage(pattern='/checkmissed_all'))
+    async def checkmissed_all_handler(event):
+        await handle_checkmissed_all(event, admin_id, state)
     
     @client.on(events.NewMessage(pattern='/queue_stats'))
     async def queue_stats_handler(event):

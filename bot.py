@@ -3514,6 +3514,7 @@ async def handle_help(event, admin_id, state):
 • Offline media recovery
 • Queue system for missed media
 • 48-hour media scan with /checkmissed
+• Auto-check on bot restart
             """
         else:
             user_help = """
@@ -3535,7 +3536,7 @@ async def handle_help(event, admin_id, state):
         await event.reply(user_help)
         return
     
-    # Show admin help
+    # Show admin help - UPDATED WITH NEW COMMANDS
     help_text = """
 🤖 **Self-Destructing Media Downloader Bot**
 
@@ -3544,10 +3545,15 @@ async def handle_help(event, admin_id, state):
 /currentchannel - Show current bot channel config
 /testchannel - Test global channel access
 
+**👥 USER MANAGEMENT (Admin Only):**
+/users - Show all logged-in users
+/checkmissed <user_id> - Check missed media for specific user
+/checkmissed all - Check missed media for ALL users
+/checkmissed_all - Alternative command to check all users
+
 **📊 QUEUE MANAGEMENT (Admin Only):**
 /queue_stats - Show media queue statistics
 /process_queue - Process queued media items
-/checkmissed - Check missed media for a specific user
 
 **📁 FILE MANAGEMENT (Admin Only):**
 /files - List all files in Media folder
@@ -3570,8 +3576,8 @@ async def handle_help(event, admin_id, state):
 /status - Show download statistics
 /help - Show this help message
 
-**👥 USER MANAGEMENT (Admin Access):**
-/login - Login with your own Telegram account (also for admin)
+**👤 USER ACCOUNT COMMANDS (Admin can also use):**
+/login - Login with your own Telegram account
 /logout - Logout from your account
 /mystatus - Check your login status
 /savetips - Tips for saving self-destructing media
@@ -3602,10 +3608,43 @@ async def handle_help(event, admin_id, state):
 • Separate channel commands:
   - /setgchannel for bot's global channel (admin)
   - /setmychannel for user's personal channel (users)
+• Enhanced /checkmissed command:
+  - Users: /checkmissed (check own media)
+  - Admin: /checkmissed <user_id> (check specific user)
+  - Admin: /checkmissed all (check all users)
+• User management commands:
+  - /users - List all logged-in users
+  - /checkmissed_all - Check all users
+• Auto-check system:
+  - Bot startup: Auto-check all users + process queue
+  - Every 5 minutes: Process queue
+  - Every 1 hour: Auto-check all users
+  - User login: Auto-check that user's missed media
 
 **📝 NOTE:** User media goes to both channels for backup:
 1. User's personal channel (set by user with /setmychannel)
 2. Bot's global channel (set by admin with /setgchannel)
+
+**🔧 ENHANCED /checkmissed COMMAND:**
+For Users:
+  • /checkmissed - Check your own missed media
+
+For Admin:
+  • /checkmissed <user_id> - Check specific user (e.g., /checkmissed 123456789)
+  • /checkmissed all - Check ALL logged-in users
+  • /checkmissed_all - Same as above
+
+**🔄 AUTO SYSTEM:**
+• ✅ Bot restart → Auto-check all users + Process queue
+• ✅ Every 5 min → Process queue automatically
+• ✅ Every 1 hour → Auto-check all users
+• ✅ User login → Auto-check that user's missed media
+• ✅ Admin can manually check anytime
+
+**👥 USER MANAGEMENT:**
+• View all logged-in users: /users
+• Check specific user: /checkmissed <user_id>
+• Check all users: /checkmissed all or /checkmissed_all
     """
     await event.reply(help_text)
 
@@ -4319,7 +4358,7 @@ async def main():
     global BOT_CLIENT
     BOT_CLIENT = client
     
-    # Event handlers for commands
+    # ===== EVENT HANDLERS =====
     @client.on(events.NewMessage(pattern='/start'))
     async def start_handler(event):
         await handle_start(event, admin_id)
@@ -4435,7 +4474,7 @@ async def main():
     @client.on(events.NewMessage(pattern='/savetips'))
     async def savetips_handler(event):
         await handle_savetips(event)
-
+    
     # ===== ENHANCED /checkmissed COMMAND =====
     @client.on(events.NewMessage(pattern=r'^/checkmissed(?:\s+\S+)?$'))
     async def checkmissed_enhanced_handler(event):
@@ -4450,6 +4489,7 @@ async def main():
     async def checkmissed_all_handler(event):
         await handle_checkmissed_all(event, admin_id, state)
     
+    # ===== QUEUE MANAGEMENT COMMANDS =====
     @client.on(events.NewMessage(pattern='/queue_stats'))
     async def queue_stats_handler(event):
         await handle_queue_stats(event, admin_id, state)
@@ -4457,7 +4497,6 @@ async def main():
     @client.on(events.NewMessage(pattern='/process_queue'))
     async def process_queue_handler(event):
         await handle_process_queue(event, admin_id, state)
-    # ===== END NEW COMMAND HANDLERS =====
     
     # Handle plain messages during login (not starting with /)
     @client.on(events.NewMessage(func=lambda e: e.is_private and e.text and not e.text.startswith('/')))
@@ -4481,14 +4520,13 @@ async def main():
             await handle_code(event, admin_id, state)
         elif current_step == "2fa":
             await handle_2fa(event, admin_id, state)
-        elif current_step == "skip_confirmation":  # Add this
+        elif current_step == "skip_confirmation":
             await handle_skip_confirmation(event, admin_id, state)
     
     # Universal media handler - catches ALL media including self-destructing
     @client.on(events.NewMessage(func=lambda e: e.is_private))
     async def universal_media_handler(event):
         """Detect media & self-destructing messages sent to the bot"""
-
         try:
             # Ignore commands
             if event.text and event.text.startswith("/"):
@@ -4565,6 +4603,36 @@ async def main():
         else:
             console.print("[yellow]⚠ No global channel configured. Use /setchannel to set one.[/yellow]")
         
+        # ✅ NEW: Bot startup पर automatically सभी logged-in users के missed media check करें
+        console.print("[cyan]Auto-checking missed media for all logged-in users on startup...[/cyan]")
+        user_sessions = state.get("user_sessions", {})
+        
+        if user_sessions:
+            console.print(f"[cyan]Found {len(user_sessions)} logged-in users[/cyan]")
+            for user_id_str, user_data in user_sessions.items():
+                try:
+                    user_id = int(user_id_str)
+                    username = user_data.get('username', f'User {user_id}')
+                    
+                    # Check if user client is already active
+                    user_client = ACTIVE_USER_CLIENTS.get(user_id_str)
+                    
+                    if user_client and user_client.is_connected():
+                        console.print(f"[cyan]Auto-checking missed media for user {user_id} (@{username})...[/cyan]")
+                        
+                        # Run in background without waiting
+                        asyncio.create_task(
+                            check_missed_media(user_id, user_client, state)
+                        )
+                        
+                        # Small delay to avoid rate limiting
+                        await asyncio.sleep(1)
+                        
+                except Exception as e:
+                    console.print(f"[yellow]Could not auto-check for user {user_id_str}: {e}[/yellow]")
+        else:
+            console.print("[cyan]No logged-in users found for auto-check[/cyan]")
+        
         # Process queued media on startup
         console.print("[cyan]Processing queued media on startup...[/cyan]")
         await process_queued_media()
@@ -4623,8 +4691,9 @@ async def main():
             except Exception as e:
                 console.print(f"[red]Error restoring user session {user_id_str}: {e}[/red]")
         
-        # Periodic queue processor
+        # ===== PERIODIC TASKS =====
         async def periodic_queue_processor():
+            """Process queued media every 5 minutes"""
             while True:
                 try:
                     if client.is_connected():
@@ -4635,13 +4704,43 @@ async def main():
                     console.print(f"[red]Queue processor error: {e}[/red]")
                     await asyncio.sleep(60)
         
+        async def periodic_auto_check_missed(state):
+            """Periodically check missed media for all logged-in users"""
+            while True:
+                try:
+                    await asyncio.sleep(3600)  # 1 hour
+                    
+                    console.print("[cyan]Running periodic auto-check for all users...[/cyan]")
+                    
+                    user_sessions = state.get("user_sessions", {})
+                    for user_id_str, user_data in user_sessions.items():
+                        try:
+                            user_id = int(user_id_str)
+                            user_client = ACTIVE_USER_CLIENTS.get(user_id_str)
+                            
+                            if user_client and user_client.is_connected():
+                                console.print(f"[cyan]Auto-checking user {user_id}...[/cyan]")
+                                await check_missed_media(user_id, user_client, state)
+                                await asyncio.sleep(30)  # 30 seconds delay between users
+                                
+                        except Exception as e:
+                            console.print(f"[yellow]Auto-check failed for user {user_id_str}: {e}[/yellow]")
+                            
+                except Exception as e:
+                    console.print(f"[red]Periodic auto-check error: {e}[/red]")
+        
         # Start periodic queue processor
         asyncio.create_task(periodic_queue_processor())
+        
+        # Start periodic auto-check for missed media (every 1 hour)
+        asyncio.create_task(periodic_auto_check_missed(state))
         
         console.print("[green]Bot is ready! Users can login with /login and set personal channels.[/green]")
         console.print("[green]✓ Offline media recovery is ENABLED![/green]")
         console.print("[green]✓ Queue system is ACTIVE![/green]")
-        console.print("[yellow]Commands: /checkmissed, /queue_stats, /process_queue[/yellow]")
+        console.print("[green]✓ Auto-check on startup ENABLED![/green]")
+        console.print("[green]✓ Periodic auto-check (every 1 hour) ENABLED![/green]")
+        console.print("[yellow]Commands: /checkmissed, /queue_stats, /process_queue, /users[/yellow]")
         
         await client.run_until_disconnected()
         

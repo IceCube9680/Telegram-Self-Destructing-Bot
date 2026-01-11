@@ -89,9 +89,8 @@ Media/
 ---
 
 ## ⚙️ Installation
-
-1️⃣ Clone Repository
 ```bash
+1️⃣ Clone Repository
 git clone https://github.com/yourusername/self-destruct-media-bot.git
 cd self-destruct-media-bot
 

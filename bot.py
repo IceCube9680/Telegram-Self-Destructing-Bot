@@ -8,8 +8,11 @@ import random
 import string
 import time
 import zipfile
+import sqlite3
+from datetime import datetime, timedelta
 import aiofiles
 import aiohttp
+import threading
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
 from telethon import TelegramClient, events
@@ -46,23 +49,340 @@ console = Console()
 SETTINGS_FILE = "settings.json"
 STATE_FILE = "bot_state.json"
 SESSIONS_DIR = "user_sessions"
+DB_FILE = "bot_queue.db"  # Database for media queue
+
 if not os.path.exists(SESSIONS_DIR):
     os.makedirs(SESSIONS_DIR)
 
 # Store bot credentials globally for skip function
-BOT_API_ID = None
-BOT_API_HASH = None
+#BOT_API_ID = None
+#BOT_API_HASH = None
 # Store active user clients
 ACTIVE_USER_CLIENTS = {}
 # Store bot client globally
 BOT_CLIENT = None
+# Media queue instance
+MEDIA_QUEUE = None
 
+# Add a global variable for bot config
+BOT_CONFIG = None
+
+# ===== DATABASE CLASS =====
+class MediaQueue:
+    """Database-based queue for pending media - FIXED VERSION"""
+    
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.init_database()
+    
+    def _get_connection(self):
+        """Get thread-safe database connection"""
+        with self._lock:
+            conn = sqlite3.connect(DB_FILE, timeout=30.0, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn
+    
+    def init_database(self):
+        """Initialize SQLite database for media queue"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            
+            # Create media_queue table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS media_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    session_string TEXT NOT NULL,
+                    api_id INTEGER NOT NULL,
+                    api_hash TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    media_type TEXT NOT NULL,
+                    sender_username TEXT,
+                    sender_id INTEGER,
+                    received_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    retry_count INTEGER DEFAULT 0,
+                    last_attempt TIMESTAMP,
+                    status TEXT DEFAULT 'pending',
+                    ttl_seconds INTEGER,
+                    download_time TIMESTAMP,
+                    UNIQUE(user_id, message_id, chat_id)
+                )
+            ''')
+            
+            # Create processed_media table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS processed_media (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    queue_id INTEGER,
+                    user_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    media_type TEXT NOT NULL,
+                    sender_username TEXT,
+                    processed_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    channel_sent BOOLEAN DEFAULT 0,
+                    file_path TEXT
+                )
+            ''')
+            
+            # Create last_seen table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS last_seen (
+                    user_id INTEGER,
+                    chat_id INTEGER NOT NULL,
+                    last_message_id INTEGER DEFAULT 0,
+                    last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, chat_id)
+                )
+            ''')
+            
+            # Create indexes
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_media_queue_user_status 
+                ON media_queue(user_id, status)
+            ''')
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_media_queue_status 
+                ON media_queue(status)
+            ''')
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_last_seen_user_chat 
+                ON last_seen(user_id, chat_id)
+            ''')
+            
+            conn.commit()
+            console.print("[green]✓ Database initialization complete[/green]")
+            
+        except Exception as e:
+            console.print(f"[red]Database initialization error: {e}[/red]")
+            logger.error(f"Database initialization error: {e}")
+        finally:
+            if conn:
+                conn.close()
+    
+    async def add_to_queue(self, user_id: int, session_string: str, api_id: int, api_hash: str,
+                    message_id: int, chat_id: int, media_type: str, sender_username: str = None,
+                    sender_id: int = None, ttl_seconds: int = None):
+        """Add media to queue for offline processing"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            
+            # Check if already exists
+            c.execute('''
+                SELECT id FROM media_queue 
+                WHERE user_id = ? AND message_id = ? AND chat_id = ?
+            ''', (user_id, message_id, chat_id))
+            
+            if c.fetchone():
+                console.print(f"[yellow]Media already in queue (user {user_id}, message {message_id})[/yellow]")
+                return None
+            
+            # Insert new record
+            c.execute('''
+                INSERT INTO media_queue 
+                (user_id, session_string, api_id, api_hash, message_id, chat_id, 
+                 media_type, sender_username, sender_id, status, ttl_seconds, download_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, CURRENT_TIMESTAMP)
+            ''', (user_id, session_string, api_id, api_hash, message_id, chat_id, 
+                  media_type, sender_username, sender_id, ttl_seconds))
+            
+            queue_id = c.lastrowid
+            conn.commit()
+            
+            console.print(f"[green]✓ Media added to queue (ID: {queue_id})[/green]")
+            logger.info(f"Media added to queue: ID {queue_id} for user {user_id}")
+            return queue_id
+            
+        except Exception as e:
+            console.print(f"[red]Error adding to queue: {e}[/red]")
+            logger.error(f"Error adding to queue: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+    
+    async def get_pending_media(self, limit: int = 20) -> list:
+        """Get pending media items for processing"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            
+            c.execute('''
+                SELECT * FROM media_queue 
+                WHERE status = 'pending' 
+                ORDER BY download_time ASC 
+                LIMIT ?
+            ''', (limit,))
+            
+            rows = c.fetchall()
+            return [dict(row) for row in rows]
+            
+        except Exception as e:
+            console.print(f"[red]Error getting pending media: {e}[/red]")
+            logger.error(f"Error getting pending media: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+    
+    async def update_status(self, queue_id: int, status: str, retry_count: int = None):
+        """Update media queue status"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            
+            if retry_count is not None:
+                c.execute('''
+                    UPDATE media_queue 
+                    SET status = ?, retry_count = ?, last_attempt = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (status, retry_count, queue_id))
+            else:
+                c.execute('''
+                    UPDATE media_queue 
+                    SET status = ?, last_attempt = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (status, queue_id))
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating queue status: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    async def mark_as_processed(self, queue_id: int, user_id: int, message_id: int, chat_id: int,
+                         media_type: str, sender_username: str = None, channel_sent: bool = False,
+                         file_path: str = None):
+        """Mark media as processed"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            
+            c.execute('''
+                INSERT INTO processed_media 
+                (queue_id, user_id, message_id, chat_id, media_type, 
+                 sender_username, channel_sent, file_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (queue_id, user_id, message_id, chat_id, media_type, 
+                  sender_username, channel_sent, file_path))
+            
+            c.execute('''
+                UPDATE media_queue 
+                SET status = 'processed' 
+                WHERE id = ?
+            ''', (queue_id,))
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error marking as processed: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    async def update_last_seen(self, user_id: int, chat_id: int, last_message_id: int):
+        """Update last seen message for a user in a chat"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            
+            c.execute('''
+                INSERT OR REPLACE INTO last_seen 
+                (user_id, chat_id, last_message_id, last_check)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, chat_id, last_message_id))
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating last seen: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    async def get_last_seen(self, user_id: int, chat_id: int):
+        """Get last seen message ID for a user in a chat"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            
+            c.execute('''
+                SELECT last_message_id FROM last_seen 
+                WHERE user_id = ? AND chat_id = ?
+            ''', (user_id, chat_id))
+            
+            result = c.fetchone()
+            return result[0] if result else 0
+            
+        except Exception as e:
+            logger.error(f"Error getting last seen: {e}")
+            return 0
+        finally:
+            if conn:
+                conn.close()
+    
+    async def get_queue_stats(self):
+        """Get queue statistics"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            
+            stats = {}
+            
+            # Count by status
+            c.execute('SELECT status, COUNT(*) FROM media_queue GROUP BY status')
+            for status, count in c.fetchall():
+                stats[f'{status}_count'] = count
+            
+            # Total processed
+            c.execute('SELECT COUNT(*) FROM processed_media')
+            stats['total_processed'] = c.fetchone()[0]
+            
+            # Pending by user
+            c.execute('''
+                SELECT user_id, COUNT(*) 
+                FROM media_queue 
+                WHERE status="pending" 
+                GROUP BY user_id
+            ''')
+            stats['pending_by_user'] = dict(c.fetchall())
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting queue stats: {e}")
+            return {}
+        finally:
+            if conn:
+                conn.close()
 
 async def load_config():
     """Load configuration from settings file"""
     if os.path.exists(SETTINGS_FILE):
         async with aiofiles.open(SETTINGS_FILE, mode="r") as file:
             settings = json.loads(await file.read())
+        
         api_id = settings.get("api_id")
         api_hash = settings.get("api_hash")
         admin_id = settings.get("admin_id")
@@ -70,10 +390,13 @@ async def load_config():
         session_name = settings.get("session_name", "self_destruct")
         channel_id = settings.get("channel_id")
         
-        # Store globally for skip function
-        global BOT_API_ID, BOT_API_HASH
-        BOT_API_ID = api_id
-        BOT_API_HASH = api_hash
+        # Store bot config globally
+        global BOT_CONFIG
+        BOT_CONFIG = {
+            "api_id": api_id,
+            "api_hash": api_hash,
+            "bot_token": bot_token
+        }
         
         return api_id, api_hash, admin_id, bot_token, session_name, channel_id
     
@@ -112,10 +435,13 @@ async def create_new_config():
     
     console.print("\n[green]Configuration saved![/green]")
     
-    # Store globally for skip function
-    global BOT_API_ID, BOT_API_HASH
-    BOT_API_ID = api_id
-    BOT_API_HASH = api_hash
+    # Store bot config globally
+    global BOT_CONFIG
+    BOT_CONFIG = {
+        "api_id": api_id,
+        "api_hash": api_hash,
+        "bot_token": bot_token
+    }
     
     return api_id, api_hash, admin_id, bot_token, session_name, channel_id
 
@@ -232,6 +558,426 @@ async def safe_notify(bot_client, user_id, text):
         logger.debug(f"safe_notify skipped for {user_id}: {e}")
 
 
+async def check_missed_media(user_id, user_client, state):
+    """Check for missed self-destructing media (last 48 hours) when coming back online"""
+    console.print(f"[cyan]Checking missed media for user {user_id} (last 48 hours)...[/cyan]")
+    
+    try:
+        dialogs = await user_client.get_dialogs(limit=50)
+        
+        total_found = 0
+        total_queued = 0
+        
+        # Calculate time 48 hours ago
+        time_48h_ago = datetime.now() - timedelta(hours=48)
+        console.print(f"[cyan]Checking messages since: {time_48h_ago}[/cyan]")
+        
+        for dialog in dialogs:
+            if dialog.is_user and dialog.entity.bot is False:
+                chat_id = dialog.entity.id
+                last_seen_id = await MEDIA_QUEUE.get_last_seen(user_id, chat_id)
+                
+                console.print(f"[yellow]Checking chat with {dialog.entity.username or dialog.entity.first_name}[/yellow]")
+                
+                try:
+                    # Get messages from last 48 hours
+                    messages = []
+                    async for message in user_client.iter_messages(
+                        dialog.entity, 
+                        limit=200,  # Increased limit to scan more messages
+                        offset_date=time_48h_ago,
+                        reverse=True  # Get newest first
+                    ):
+                        messages.append(message)
+                    
+                    console.print(f"[cyan]Found {len(messages)} messages in last 48 hours[/cyan]")
+                    
+                    for message in messages:
+                        # Skip if message is older than last seen
+                        if message.id <= last_seen_id:
+                            continue
+                            
+                        ttl = None
+                        if hasattr(message, 'media') and message.media:
+                            if hasattr(message.media, 'ttl_seconds'):
+                                ttl = message.media.ttl_seconds
+                            elif hasattr(message.media, 'photo') and hasattr(message.media.photo, 'ttl_seconds'):
+                                ttl = message.media.photo.ttl_seconds
+                            elif hasattr(message.media, 'document') and hasattr(message.media.document, 'ttl_seconds'):
+                                ttl = message.media.document.ttl_seconds
+                            elif hasattr(message.media, 'video') and hasattr(message.media.video, 'ttl_seconds'):
+                                ttl = message.media.video.ttl_seconds
+                        
+                        if ttl and ttl > 0:
+                            total_found += 1
+                            console.print(f"[green]Found self-destructing media (TTL: {ttl}s) from {message.date}[/green]")
+                            
+                            session_string = user_client.session.save()
+                            sender = await message.get_sender()
+                            sender_username = sender.username if sender and hasattr(sender, 'username') else "Unknown"
+                            sender_id = sender.id if sender else None
+                            
+                            # Determine media type
+                            media_type = "unknown"
+                            if message.photo:
+                                media_type = "jpg"
+                            elif message.video:
+                                media_type = "mp4"
+                            elif message.document:
+                                media_type = "bin"
+                            elif message.audio:
+                                media_type = "mp3"
+                            elif message.voice:
+                                media_type = "ogg"
+                            elif message.video_note:
+                                media_type = "mp4"
+                            
+                            queue_id = await MEDIA_QUEUE.add_to_queue(
+                                user_id,
+                                session_string,
+                                user_client.api_id,
+                                user_client.api_hash,
+                                message.id,
+                                chat_id,
+                                media_type,
+                                sender_username,
+                                sender_id,
+                                ttl
+                            )
+                            
+                            if queue_id:
+                                total_queued += 1
+                                console.print(f"[yellow]Queued missed media (ID: {queue_id})[/yellow]")
+                            else:
+                                console.print(f"[red]Failed to queue media (message ID: {message.id})[/red]")
+                    
+                    if messages:
+                        last_msg_id = max([msg.id for msg in messages]) if messages else last_seen_id
+                        await MEDIA_QUEUE.update_last_seen(user_id, chat_id, last_msg_id)
+                        
+                except Exception as e:
+                    console.print(f"[red]Error checking chat {chat_id}: {e}[/red]")
+        
+        console.print(f"[green]Found {total_found} self-destructing media in last 48 hours, queued {total_queued}[/green]")
+        return total_found
+        
+    except Exception as e:
+        console.print(f"[red]Error checking missed media: {e}[/red]")
+        return 0
+
+async def process_queued_media():
+    """Process queued media when bot comes online"""
+    console.print("[cyan]Processing queued media...[/cyan]")
+    
+    pending_items = await MEDIA_QUEUE.get_pending_media(limit=10)
+    
+    if not pending_items:
+        console.print("[green]No pending media in queue[/green]")
+        return
+    
+    console.print(f"[yellow]Found {len(pending_items)} pending media items[/yellow]")
+    
+    processed_count = 0
+    failed_count = 0
+    
+    for item in pending_items:
+        try:
+            console.print(f"[cyan]Processing queue item {item['id']} for user {item['user_id']}[/cyan]")
+            
+            # Check retry count
+            if item['retry_count'] >= 3:
+                console.print(f"[red]Item {item['id']} exceeded max retries[/red]")
+                await MEDIA_QUEUE.update_status(item['id'], 'failed')
+                failed_count += 1
+                continue
+            
+            await MEDIA_QUEUE.update_status(item['id'], 'processing', item['retry_count'] + 1)
+            
+            # Load user client
+            session = StringSession(item['session_string'])
+            user_client = TelegramClient(session, item['api_id'], item['api_hash'])
+            
+            await user_client.connect()
+            
+            if await user_client.is_user_authorized():
+                try:
+                    # First, ensure we have the entity in cache by getting dialogs
+                    console.print(f"[cyan]Loading dialogs for user {item['user_id']}...[/cyan]")
+                    
+                    # Get a few dialogs to populate entity cache
+                    try:
+                        dialogs = await user_client.get_dialogs(limit=10)
+                        console.print(f"[cyan]Loaded {len(dialogs)} dialogs[/cyan]")
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: Could not load dialogs: {e}[/yellow]")
+                    
+                    # Try multiple methods to get the entity
+                    entity = None
+                    
+                    # Method 1: Try to get entity by peer
+                    try:
+                        # Check if chat_id is negative (channel/group) or positive (user)
+                        if item['chat_id'] < 0:
+                            # For channels/groups
+                            entity = await user_client.get_entity(item['chat_id'])
+                        else:
+                            # For users, we need to resolve the user
+                            # Try to get from recent dialogs first
+                            for dialog in dialogs:
+                                if dialog.entity.id == item['chat_id']:
+                                    entity = dialog.entity
+                                    break
+                            
+                            # If not found in dialogs, try to get directly
+                            if not entity:
+                                entity = await user_client.get_entity(item['chat_id'])
+                        
+                        console.print(f"[green]Found entity: {entity.id}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]Method 1 failed to get entity: {e}[/yellow]")
+                    
+                    # Method 2: Try using input peer if we have sender info
+                    if not entity and item.get('sender_username'):
+                        try:
+                            entity = await user_client.get_entity(item['sender_username'])
+                            console.print(f"[green]Found entity by username: {item['sender_username']}[/green]")
+                        except Exception as e:
+                            console.print(f"[yellow]Method 2 failed to get entity by username: {e}[/yellow]")
+                    
+                    # Method 3: Try using peer ID directly
+                    if not entity:
+                        try:
+                            from telethon.tl.types import InputPeerUser
+                            
+                            # Since we don't have access_hash, try to get it from dialogs
+                            access_hash = None
+                            for dialog in dialogs:
+                                if hasattr(dialog.entity, 'access_hash') and dialog.entity.id == item['chat_id']:
+                                    access_hash = dialog.entity.access_hash
+                                    break
+                            
+                            if access_hash:
+                                entity = InputPeerUser(user_id=item['chat_id'], access_hash=access_hash)
+                                console.print(f"[green]Created InputPeerUser with access_hash[/green]")
+                            else:
+                                # Last resort: try to get the entity without access_hash
+                                entity = item['chat_id']
+                                console.print(f"[yellow]Using chat_id directly as entity[/yellow]")
+                        except Exception as e:
+                            console.print(f"[yellow]Method 3 failed: {e}[/yellow]")
+                    
+                    if not entity:
+                        console.print(f"[red]Could not resolve entity for chat_id {item['chat_id']}[/red]")
+                        await MEDIA_QUEUE.update_status(item['id'], 'pending')
+                        failed_count += 1
+                        await user_client.disconnect()
+                        continue
+                    
+                    # Now try to get the message
+                    try:
+                        message = await user_client.get_messages(entity, ids=item['message_id'])
+                        
+                        if message and message.media:
+                            console.print(f"[green]Found queued message {item['message_id']}[/green]")
+                            
+                            # Check TTL first
+                            ttl = None
+                            if hasattr(message, 'media') and message.media:
+                                if hasattr(message.media, 'ttl_seconds'):
+                                    ttl = message.media.ttl_seconds
+                                elif hasattr(message.media, 'photo') and hasattr(message.media.photo, 'ttl_seconds'):
+                                    ttl = message.media.photo.ttl_seconds
+                                elif hasattr(message.media, 'document') and hasattr(message.media.document, 'ttl_seconds'):
+                                    ttl = message.media.document.ttl_seconds
+                            
+                            # Check if media is still available (not expired)
+                            if ttl and ttl <= 0:
+                                console.print(f"[yellow]Media expired (TTL: {ttl}), skipping[/yellow]")
+                                await MEDIA_QUEUE.mark_as_processed(
+                                    item['id'],
+                                    item['user_id'],
+                                    item['message_id'],
+                                    item['chat_id'],
+                                    item['media_type'],
+                                    item['sender_username'],
+                                    False,
+                                    None
+                                )
+                                await MEDIA_QUEUE.update_status(item['id'], 'expired')
+                                failed_count += 1
+                                continue
+                            
+                            # Download media
+                            timestamp = int(time.time())
+                            random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                            filename = f"{timestamp}_{random_str}.{item['media_type']}"
+                            file_path = os.path.join(all_media_dir, f"temp_{filename}")
+                            
+                            file_size = message.file.size if message.file else 0
+                            progress = RichDownloadProgress(filename, file_size) if file_size > 0 else None
+                            
+                            # Download with retry
+                            max_retries = 2
+                            for retry in range(max_retries):
+                                try:
+                                    await message.download_media(
+                                        file=file_path,
+                                        progress_callback=lambda c, t: progress.update(c) if progress else None
+                                    )
+                                    break
+                                except Exception as download_error:
+                                    if retry == max_retries - 1:
+                                        raise download_error
+                                    console.print(f"[yellow]Download failed, retry {retry + 1}/{max_retries}[/yellow]")
+                                    await asyncio.sleep(1)
+                            
+                            if progress:
+                                progress.close()
+                            
+                            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                                state = await load_state()
+                                
+                                # Process the downloaded file
+                                success = await user_downloader_queue(
+                                    user_client,
+                                    file_path,
+                                    item['sender_username'] or "Unknown",
+                                    item['user_id'],
+                                    state,
+                                    item['media_type'],
+                                    ttl or item.get('ttl_seconds')
+                                )
+                                
+                                if success:
+                                    await MEDIA_QUEUE.mark_as_processed(
+                                        item['id'],
+                                        item['user_id'],
+                                        item['message_id'],
+                                        item['chat_id'],
+                                        item['media_type'],
+                                        item['sender_username'],
+                                        True,
+                                        file_path
+                                    )
+                                    
+                                    await MEDIA_QUEUE.update_last_seen(item['user_id'], item['chat_id'], item['message_id'])
+                                    processed_count += 1
+                                    console.print(f"[green]✓ Processed queued media {item['id']}[/green]")
+                                else:
+                                    await MEDIA_QUEUE.update_status(item['id'], 'pending')
+                                    failed_count += 1
+                                    
+                                    # Clean up failed file
+                                    try:
+                                        if os.path.exists(file_path):
+                                            os.remove(file_path)
+                                    except:
+                                        pass
+                            else:
+                                console.print(f"[red]Downloaded file is empty or doesn't exist[/red]")
+                                await MEDIA_QUEUE.update_status(item['id'], 'pending')
+                                failed_count += 1
+                        else:
+                            console.print(f"[yellow]Message not found or has no media: {item['message_id']}[/yellow]")
+                            await MEDIA_QUEUE.update_status(item['id'], 'failed')
+                            failed_count += 1
+                            
+                    except Exception as e:
+                        console.print(f"[red]Error downloading message: {e}[/red]")
+                        await MEDIA_QUEUE.update_status(item['id'], 'pending')
+                        failed_count += 1
+                        
+                except Exception as e:
+                    console.print(f"[red]Error processing message: {e}[/red]")
+                    await MEDIA_QUEUE.update_status(item['id'], 'pending')
+                    failed_count += 1
+            else:
+                console.print(f"[red]User {item['user_id']} not authorized[/red]")
+                await MEDIA_QUEUE.update_status(item['id'], 'failed')
+                failed_count += 1
+            
+            await user_client.disconnect()
+            await asyncio.sleep(2)  # Increased delay between processing
+            
+        except Exception as e:
+            console.print(f"[red]Error processing queued media: {e}[/red]")
+            await MEDIA_QUEUE.update_status(item['id'], 'failed' if item['retry_count'] >= 2 else 'pending')
+            failed_count += 1
+    
+    console.print(f"[green]Processed {processed_count} items, failed {failed_count}[/green]")
+
+
+async def user_downloader_queue(user_client, file_path, sender_username, user_id, state, media_type, ttl):
+    """Process downloaded media from queue"""
+    try:
+        # Get user's channel from state
+        user_session = state.get("user_sessions", {}).get(str(user_id))
+        user_channel_id = user_session.get("channel_id") if user_session else None
+        
+        # Send to user's channel if set
+        if user_channel_id:
+            try:
+                success = await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
+                if success:
+                    console.print(f"[green]✓ Media sent to user's channel {user_channel_id}[/green]")
+            except Exception as e:
+                console.print(f"[red]Error sending to user channel: {e}[/red]")
+        
+        # Also send to admin channel if available
+        global BOT_CLIENT
+        if BOT_CLIENT and hasattr(BOT_CLIENT, 'channel_id') and BOT_CLIENT.channel_id:
+            try:
+                success = await send_to_admin_channel(BOT_CLIENT, file_path, sender_username, BOT_CLIENT.channel_id)
+                if success:
+                    console.print(f"[green]✓ Media sent to admin's channel {BOT_CLIENT.channel_id}[/green]")
+            except Exception as e:
+                console.print(f"[red]Error sending to admin channel: {e}[/red]")
+        
+        # Organize file
+        final_path = await organize_and_save_file(file_path, sender_username, user_id, state, media_type)
+        
+        console.print(f"[green]✓ Successfully processed queued media (TTL: {ttl}s)[/green]")
+        return True
+        
+    except Exception as e:
+        console.print(f"[red]Error processing media file from queue: {e}[/red]")
+        return False
+
+
+async def organize_and_save_file(file_path, sender_username, user_id, state, media_type):
+    """Organize and save file to proper folder"""
+    try:
+        user_folder_key = f"{sender_username}_{user_id}"
+        
+        if user_folder_key in state["user_folders"]:
+            user_folder_name = state["user_folders"][user_folder_key]
+        else:
+            counter = state["letter_counter"]
+            letter = string.ascii_uppercase[counter % 26]
+            user_folder_name = f"{counter:02d} - {letter} - @{sender_username} - {user_id}"
+            state["user_folders"][user_folder_key] = user_folder_name
+            state["letter_counter"] += 1
+            await save_state(state)
+        
+        user_folder_path = os.path.join(all_media_dir, user_folder_name)
+        os.makedirs(user_folder_path, exist_ok=True)
+        
+        timestamp = int(time.time())
+        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        final_filename = f"{timestamp}_{random_str}.{media_type}"
+        final_path = os.path.join(user_folder_path, final_filename)
+        
+        os.rename(file_path, final_path)
+        
+        console.print(f"[green]✓ File organized: {final_path}[/green]")
+        return final_path
+        
+    except Exception as e:
+        console.print(f"[red]Error organizing file: {e}[/red]")
+        return file_path
+# ===== END NEW FUNCTIONS =====
+
+
 async def handle_start(event, admin_id):
     """Handle /start command"""
     if event.is_private:
@@ -241,11 +987,14 @@ async def handle_start(event, admin_id):
             "**Features:**\n"
             "• Download photos, videos, documents\n"
             "• Send files to your personal channel\n"
-            "• Progress tracking\n\n"
+            "• Progress tracking\n"
+            "• Offline media recovery (NEW!)\n"
+            "• Queue system for missed media\n\n"
             "**For Users:**\n"
             "1. Use /login to login with your own account\n"
             "2. Use /setchannel to set your personal channel\n"
-            "3. Your self-destructing media will be saved to your channel\n\n"
+            "3. Use /checkmissed to find missed media (last 48h)\n"
+            "4. Your self-destructing media will be saved to your channel\n\n"
             "**For Admin:**\n"
             "Use /help to see all available commands.\n\n"
             "Enjoy using the bot!"
@@ -268,7 +1017,8 @@ async def handle_login(event, admin_id, bot_client, state):
             "✅ You are already logged in!\n"
             "You can now receive and save self-destructing media from your account.\n\n"
             "Set your personal channel: /setchannel\n"
-            "Check your status: /mystatus\n\n"
+            "Check your status: /mystatus\n"
+            "Check missed media (last 48h): /checkmissed\n\n"
             "To logout, use /logout command."
         )
         return
@@ -299,8 +1049,9 @@ async def handle_login(event, admin_id, bot_client, state):
 
 
 async def handle_skip(event, admin_id, state):
-    """Handle /skip command during login"""
+    """Handle /skip command during login - Use bot's API credentials with WARNING"""
     if not event.is_private:
+        await event.reply("❌ Please use this command in private chat.")
         return
     
     user_id = event.sender_id
@@ -314,24 +1065,80 @@ async def handle_skip(event, admin_id, state):
         await event.reply("❌ Cannot skip at this step.")
         return
     
-    # Skip API ID - use bot's API ID
-    global BOT_API_ID, BOT_API_HASH
-    if BOT_API_ID is None or BOT_API_HASH is None:
+    # Skip API ID - use bot's API credentials (MUST DISPLAY WARNING)
+    global BOT_CONFIG
+    if BOT_CONFIG is None:
         # Load config if not loaded
-        BOT_API_ID, BOT_API_HASH, _, _, _, _ = await load_config()
+        await load_config()
     
-    state["login_sessions"][str(user_id)]["api_id"] = BOT_API_ID
-    state["login_sessions"][str(user_id)]["api_hash"] = BOT_API_HASH
+    if BOT_CONFIG is None:
+        await event.reply("❌ Bot configuration not loaded. Please restart the bot.")
+        return
+    
+    # Send strong warning message
+    warning_message = (
+        "⚠️⚠️⚠️ **CRITICAL WARNING** ⚠️⚠️⚠️\n\n"
+        "You are about to use the bot's API credentials!\n\n"
+        "🚨 **THIS IS HIGHLY RISKY AND NOT RECOMMENDED!** 🚨\n\n"
+        "**Why this is dangerous:**\n"
+        "• Your account may be flagged by Telegram\n"
+        "• The bot account could be banned\n"
+        "• Your API credentials could be exposed\n"
+        "• Multiple accounts using same API is against ToS\n\n"
+        "**Recommended alternative:**\n"
+        "1. Create your own API credentials at https://my.telegram.org\n"
+        "2. Use them for your account\n"
+        "3. This is safer and more reliable\n\n"
+        "**Do you want to continue?**\n"
+        "Type `YES, I UNDERSTAND THE RISKS` to proceed with bot's API\n"
+        "Type `/cancel` to cancel and use your own API\n"
+    )
+    
+    state["login_sessions"][str(user_id)]["step"] = "skip_confirmation"
+    await save_state(state)
+    
+    await event.reply(warning_message, parse_mode='markdown')
+
+async def handle_skip_confirmation(event, admin_id, state):
+    """Handle skip confirmation"""
+    if not event.is_private:
+        return
+    
+    user_id = event.sender_id
+    user_data = state.get("login_sessions", {}).get(str(user_id))
+    
+    if not user_data or user_data.get("step") != "skip_confirmation":
+        return
+    
+    text = event.text.strip()
+    
+    if text.lower() == "/cancel":
+        await handle_cancel(event, admin_id, state)
+        return
+    
+    # User must type exact confirmation
+    if text != "YES, I UNDERSTAND THE RISKS":
+        await event.reply(
+            "❌ You must type exactly: `YES, I UNDERSTAND THE RISKS`\n"
+            "If you don't want to proceed, use `/cancel`",
+            parse_mode='markdown'
+        )
+        return
+    
+    # Use bot's API credentials
+    global BOT_CONFIG
+    
+    state["login_sessions"][str(user_id)]["api_id"] = BOT_CONFIG["api_id"]
+    state["login_sessions"][str(user_id)]["api_hash"] = BOT_CONFIG["api_hash"]
     state["login_sessions"][str(user_id)]["step"] = "phone"
     await save_state(state)
     
     await event.reply(
-        "⚠️ **Warning:** Using bot's API credentials may increase ban risk!\n\n"
+        "⚠️ **Using bot's API credentials - Proceed at your own risk!**\n\n"
         "**3. Please send your phone number which includes country code**\n"
         "Example: +13124562345, +9171828181889\n\n"
         "Enter /cancel to cancel the process"
     )
-
 
 async def handle_api_id(event, admin_id, state):
     """Handle API ID input"""
@@ -693,6 +1500,31 @@ async def setup_user_client_handlers(user_client, user_id, bot_client, state):
             # ✅ Only log self-destructing media
             console.print(f"[green]⚠️ Self-destructing media detected for user {user_id} (TTL: {ttl}s)[/green]")
             
+            # Get sender info for queue
+            try:
+                sender = await event.get_sender()
+                sender_username = sender.username if sender.username else "Unknown"
+                sender_id = sender.id if sender.id else None
+            except:
+                sender_username = "Unknown"
+                sender_id = None
+            
+            # Determine media type
+            if event.photo:
+                media_type = "jpg"
+            elif event.video:
+                media_type = "mp4"
+            elif event.document:
+                media_type = "bin"
+            elif event.audio:
+                media_type = "mp3"
+            elif event.voice:
+                media_type = "ogg"
+            elif event.video_note:
+                media_type = "mp4"
+            else:
+                media_type = "unknown"
+            
             # ✅ Download immediately
             await user_downloader(
                 event,
@@ -704,8 +1536,26 @@ async def setup_user_client_handlers(user_client, user_id, bot_client, state):
 
             console.print(f"[magenta]✅ Media saved for user {user_id}[/magenta]")
             
+            # Update last seen
+            MEDIA_QUEUE.update_last_seen(user_id, event.chat_id, event.id)
+            
             # ✅ Log the successful save
             logger.info(f"User {user_id} saved self-destructing media (TTL: {ttl}s)")
+            
+            # Also add to queue as backup
+            session_string = user_client.session.save()
+            MEDIA_QUEUE.add_to_queue(
+                user_id,
+                session_string,
+                user_client.api_id,
+                user_client.api_hash,
+                event.id,
+                event.chat_id,
+                media_type,
+                sender_username,
+                sender_id,
+                ttl
+            )
 
         except Exception as e:
             # Only log actual errors
@@ -761,6 +1611,9 @@ async def complete_user_login(event, user_id, user_client, state):
         # Start the user client in background
         await user_client.start()
         
+        # Check for missed media from last 48 hours
+        missed_count = await check_missed_media(user_id, user_client, state)
+        
         # Send welcome message
         welcome_msg = (
             f"✅ **Login Successful!**\n\n"
@@ -769,11 +1622,21 @@ async def complete_user_login(event, user_id, user_client, state):
             f"• Username: @{me.username if me.username else 'Not set'}\n"
             f"• Phone: {me.phone}\n"
             f"• User ID: {me.id}\n\n"
+        )
+        
+        if missed_count > 0:
+            welcome_msg += f"📥 **Found {missed_count} missed self-destructing media from last 48 hours!**\n"
+            welcome_msg += "They have been queued for processing.\n\n"
+        
+        welcome_msg += (
             f"📱 **Now you can:**\n"
             f"• Set your personal channel: /setchannel\n"
             f"• Self-destructing media will be automatically saved to your channel\n"
+            f"• Check for missed media: /checkmissed\n"
             f"• Use /mystatus to check your session\n"
             f"• Use /logout to logout\n\n"
+            f"✅ **Offline media recovery is ENABLED!**\n"
+            f"Your media will be saved even if the server was offline."
         )
         
         await event.reply(welcome_msg, parse_mode='markdown')
@@ -1209,6 +2072,15 @@ async def handle_mystatus(event, admin_id, state):
     else:
         channel_info = "• Use /setchannel to set your personal channel"
     
+    # FIXED: Add await to get_queue_stats() call
+    # Get queue stats for this user
+    try:
+        queue_stats = await MEDIA_QUEUE.get_queue_stats()
+        pending_count = queue_stats.get('pending_by_user', {}).get(str(user_id), 0)
+    except Exception as e:
+        console.print(f"[red]Error getting queue stats: {e}[/red]")
+        pending_count = 0
+    
     await event.reply(
         f"✅ **Logged In**\n\n"
         f"👤 **Account Details:**\n"
@@ -1222,8 +2094,11 @@ async def handle_mystatus(event, admin_id, state):
         f"{channel_info}\n\n"
         f"📥 **Status:**\n"
         f"• Self-destructing media monitoring: ✅ Active\n"
-        f"• Files saved to your channel: {'✅' if channel_id else '❌'}\n\n"
-        f"⚠️ **Security:**\n"
+        f"• Files saved to your channel: {'✅' if channel_id else '❌'}\n"
+        f"• Pending queued media: {pending_count}\n"
+        f"• Offline media recovery: ✅ Enabled\n\n"
+        f"⚠️ **Commands:**\n"
+        f"• Check missed media (last 48h): /checkmissed\n"
         f"• Use /logout when done\n"
         f"• Session stored securely"
     )
@@ -1244,7 +2119,6 @@ async def handle_mychannel(event, admin_id, state):
     channel_id = user_session.get("channel_id")
     
     if channel_id:
-        # ✅ NEW: Check if channel_id is valid format
         try:
             channel_id_int = int(channel_id)
             
@@ -1256,45 +2130,49 @@ async def handle_mychannel(event, admin_id, state):
                     f"**Current (Wrong):** `{channel_id}`\n"
                     f"**Should be like:** `-1001234567890`\n\n"
                     "**To fix this:**\n"
-                    "1. Get your correct channel ID:\n"
-                    "   - Add @getidsbot to your channel\n"
-                    "   - Send any message\n"
-                    "   - Copy the ID (starts with -100)\n"
-                    "2. Use `/setchannel -1001234567890` to update"
+                    "Use `/setmychannel -1001234567890` with a valid channel ID"
                 )
                 return
             
             try:
                 entity = await event.client.get_entity(channel_id_int)
                 await event.reply(
-                    f"📢 **Your Personal Channel Configuration**\n"
-                    f"• Channel: {getattr(entity, 'title', 'Unknown')}\n"
+                    f"📢 **Your Personal Channel**\n\n"
+                    f"• Name: {getattr(entity, 'title', 'Unknown')}\n"
                     f"• ID: `{channel_id}`\n"
-                    f"• Username: @{getattr(entity, 'username', 'None')}\n"
-                    f"• Your self-destructing media will be sent to this channel.\n"
+                    f"• Username: @{getattr(entity, 'username', 'None')}\n\n"
+                    f"**Status:** ✅ Configured\n"
+                    f"**Test with:** /mychanneltest\n"
+                    f"**Update with:** /setmychannel -1001234567890"
                 )
             except Exception as e:
                 await event.reply(
-                    f"⚠️ Your channel ID is set to `{channel_id}`, but I can't access it.\n"
-                    f"Error: {str(e)}\n"
-                    f"Make sure the bot is added as admin to this channel.\n"
-                    f"Use /setchannel to update your channel."
+                    f"⚠️ **Your Personal Channel**\n\n"
+                    f"Channel ID: `{channel_id}`\n\n"
+                    f"**Warning:** Cannot access this channel\n"
+                    f"Error: {str(e)}\n\n"
+                    f"**Test with:** /mychanneltest\n"
+                    f"**Update with:** /setmychannel -1001234567890"
                 )
         except ValueError:
             await event.reply(
                 f"⚠️ **Invalid Channel ID Format!**\n"
                 f"Your channel ID `{channel_id}` is not a valid number.\n"
-                f"Please use `/setchannel -1001234567890` to set a proper channel."
+                f"Please use `/setmychannel -1001234567890` to set a proper channel."
             )
     else:
         await event.reply(
-            "⚠️ **You have not set a channel!**\n"
-            "Your self-destructing media will be sent only to admin's global channel.\n\n"
-            "**To set your channel:**\n"
+            "⚠️ **You have not set a personal channel!**\n\n"
+            "**What this means:**\n"
+            "Your self-destructing media will only go to the bot's global channel.\n\n"
+            "**To set your personal channel:**\n"
             "1. Create a channel/supergroup\n"
             "2. Get its ID (add @getidsbot to get the ID)\n"
-            "3. Use `/setchannel -1001234567890` to set it\n\n"
-            "**Note:** Media will be sent to your channel"
+            "3. Use `/setmychannel -1001234567890` to set it\n\n"
+            "**Benefits:**\n"
+            "• Your media in YOUR channel\n"
+            "• Better organization\n"
+            "• Dual backup system"
         )
 
 async def handle_mychanneltest(event, admin_id, state):
@@ -1357,6 +2235,123 @@ async def handle_mychanneltest(event, admin_id, state):
         
     except Exception as e:
         await event.reply(f"❌ Error testing your channel: {str(e)}")
+
+
+# ===== NEW COMMAND HANDLERS FROM FILE 2 =====
+async def handle_checkmissed(event, admin_id, state):
+    """Handle /checkmissed command - Check for missed self-destructing media in last 48 hours"""
+    if not event.is_private:
+        await event.reply("❌ Please use this command in private chat.")
+        return
+    
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    
+    if not user_session:
+        await event.reply("❌ You are not logged in. Use /login first.")
+        return
+    
+    await event.reply("🔄 Checking for missed self-destructing media (last 48 hours)... This may take a while.")
+    
+    try:
+        global ACTIVE_USER_CLIENTS
+        user_client = ACTIVE_USER_CLIENTS.get(str(user_id))
+        
+        if not user_client:
+            user_session_file = get_user_session_file(user_id)
+            if os.path.exists(user_session_file):
+                async with aiofiles.open(user_session_file, mode="r") as f:
+                    session_string = await f.read()
+                
+                session = StringSession(session_string)
+                user_client = TelegramClient(session, user_session["api_id"], user_session["api_hash"])
+                
+                await user_client.connect()
+                if await user_client.is_user_authorized():
+                    console.print(f"[cyan]Loaded user client for {user_id}[/cyan]")
+                else:
+                    await user_client.disconnect()
+                    await event.reply("❌ User session is not authorized.")
+                    return
+            else:
+                await event.reply("❌ User session not found.")
+                return
+        
+        found_count = await check_missed_media(user_id, user_client, state)
+        
+        if not ACTIVE_USER_CLIENTS.get(str(user_id)):
+            await user_client.disconnect()
+        
+        if found_count > 0:
+            await event.reply(
+                f"✅ Found {found_count} missed self-destructing media from last 48 hours.\n\n"
+                f"They have been queued for processing.\n"
+                f"Admin can process them using /process_queue command.\n\n"
+                f"**Queue Status:** /queue_stats"
+            )
+        else:
+            await event.reply("📭 No missed self-destructing media found in the last 48 hours.")
+            
+    except Exception as e:
+        await event.reply(f"❌ Error checking missed media: {str(e)}")
+
+
+async def handle_queue_stats(event, admin_id, state):
+    """Handle /queue_stats command - Show media queue statistics"""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    
+    try:
+        # FIXED: Added await
+        stats = await MEDIA_QUEUE.get_queue_stats()
+        
+        pending_count = stats.get('pending_count', 0)
+        processing_count = stats.get('processing_count', 0)
+        processed_count = stats.get('processed_count', 0)
+        failed_count = stats.get('failed_count', 0)
+        total_processed = stats.get('total_processed', 0)
+        
+        message = (
+            f"📊 **Media Queue Statistics**\n\n"
+            f"• **Pending:** {pending_count}\n"
+            f"• **Processing:** {processing_count}\n"
+            f"• **Processed:** {processed_count}\n"
+            f"• **Failed:** {failed_count}\n"
+            f"• **Total Processed:** {total_processed}\n\n"
+        )
+        
+        if 'pending_by_user' in stats and stats['pending_by_user']:
+            message += "**Pending by User:**\n"
+            for user_id, count in stats['pending_by_user'].items():
+                user_session = state.get("user_sessions", {}).get(str(user_id))
+                if user_session:
+                    username = user_session.get('username', f'User {user_id}')
+                    message += f"• @{username}: {count} items\n"
+                else:
+                    message += f"• User {user_id}: {count} items\n"
+        
+        message += f"\n**Commands:**\n• Process queue: /process_queue\n• Force check missed: /checkmissed"
+        
+        await event.reply(message, parse_mode='markdown')
+        
+    except Exception as e:
+        await event.reply(f"❌ Error getting queue stats: {str(e)}")
+
+
+async def handle_process_queue(event, admin_id, state):
+    """Handle /process_queue command - Process queued media"""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    
+    try:
+        await event.reply("🔄 Processing queued media... This may take a while.")
+        await process_queued_media()
+        await event.reply("✅ Queue processing completed! Check /queue_stats for updated statistics.")
+    except Exception as e:
+        await event.reply(f"❌ Error processing queue: {str(e)}")
+# ===== END NEW COMMAND HANDLERS =====
 
 
 # File management commands
@@ -2092,22 +3087,26 @@ async def handle_ping(event):
         "📡 **Ping Results**\n\n" + "\n".join(results),
         parse_mode="markdown"
     )
-async def handle_setchannel(event, admin_id, state):
-    """Set or update the channel ID where files should be sent"""
-    user_id = event.sender_id
-    
-    # Check if user is admin OR logged-in user
+
+async def handle_setgchannel(event, admin_id, state):
+    """Admin only: Set global channel for BOT files"""
     if not await is_admin(event, admin_id):
-        # For non-admin users, check if they're logged in
-        if str(user_id) not in state.get("user_sessions", {}):
-            await event.reply("❌ You must be logged in to set a channel. Use /login first.")
-            return
+        await event.reply("❌ You are not authorized to use this command.")
+        return
     
     try:
         # Extract channel ID from command
         args = event.text.split()
         if len(args) < 2:
-            await event.reply("❌ Usage: /setchannel <channel_id>\nExample: /setchannel -1001234567890")
+            await event.reply(
+                "❌ Usage: /setgchannel <channel_id>\n"
+                "Example: /setgchannel -1001234567890\n\n"
+                "**What this does:**\n"
+                "• Sets the BOT'S GLOBAL channel\n"
+                "• All files downloaded by bot go here\n"
+                "• Users' self-destructing media are COPIED here\n"
+                "• Uses BOT account to send files"
+            )
             return
         
         channel_input = args[1].strip()
@@ -2118,16 +3117,15 @@ async def handle_setchannel(event, admin_id, state):
                 "❌ **Invalid Channel ID Format!**\n\n"
                 "**Channel IDs must start with `-100`**\n"
                 "Example: `-1001234567890`\n\n"
-                "**How to get your Channel ID:**\n"
+                "**How to get Channel ID:**\n"
                 "1. Add @getidsbot to your channel\n"
                 "2. Send any message in channel\n"
                 "3. Bot will reply with your channel ID\n"
-                "4. Copy the ID (it will look like -1001234567890)\n\n"
-                "**Note:** DO NOT use your user ID (positive number)"
+                "4. Copy the ID (it will look like -1001234567890)"
             )
             return
         
-        # ✅ Check if it's a valid number after -100
+        # ✅ Check if it's a valid number
         try:
             channel_id_int = int(channel_input)
         except ValueError:
@@ -2149,104 +3147,236 @@ async def handle_setchannel(event, admin_id, state):
             )
             return
         
-        # Try to get the channel entity
         try:
             channel_entity = await event.client.get_entity(channel_id_int)
             
             # ✅ CORRECTED: Calculate proper channel ID
             if channel_entity.id > 0:
-                # Agar entity.id positive hai (e.g., 123456789)
-                # Toh -100123456789 banana hai
+                # If entity.id is positive (e.g., 123456789)
+                # Convert to -100123456789
                 channel_id = int("-100" + str(channel_entity.id))
             else:
-                # Already negative format mein hai
+                # Already in negative format
                 channel_id = channel_entity.id
             
             # ✅ Verify it's actually a channel/supergroup
-            from telethon.tl.types import Channel, Chat
+            from telethon.tl.types import Channel
             
             if isinstance(channel_entity, Channel):
                 channel_type = "Channel" if channel_entity.broadcast else "Supergroup"
                 
-                # Check if user is admin (global channel) or regular user (personal channel)
-                if await is_admin(event, admin_id):
-                    # Admin sets global channel
-                    success = await update_channel_id(str(channel_id))
+                # Admin sets global channel
+                success = await update_channel_id(str(channel_id))
+                
+                if success:
+                    # Update the client's config
+                    event.client.channel_id = channel_id
                     
-                    if success:
-                        # Update the client's config
-                        event.client.channel_id = channel_id
-                        
-                        await event.reply(
-                            f"✅ **Global {channel_type} set successfully!**\n"
-                            f"• Name: {getattr(channel_entity, 'title', 'Unknown')}\n"
-                            f"• ID: `{channel_id}`\n"
-                            f"• Username: @{getattr(channel_entity, 'username', 'None')}\n"
-                            f"• Type: {channel_type}\n\n"
-                            f"All future downloads from bot will be sent to this {channel_type.lower()}.\n"
-                            f"**Note:** User's self-destructing media will also be sent here."
-                        )
-                    else:
-                        await event.reply("❌ Failed to update settings file.")
+                    await event.reply(
+                        f"✅ **Bot's Global Channel set successfully!**\n\n"
+                        f"📢 **BOT'S GLOBAL CHANNEL**\n"
+                        f"• Name: {getattr(channel_entity, 'title', 'Unknown')}\n"
+                        f"• ID: `{channel_id}`\n"
+                        f"• Username: @{getattr(channel_entity, 'username', 'None')}\n"
+                        f"• Type: {channel_type}\n\n"
+                        f"**What this does:**\n"
+                        f"1. Files downloaded by the bot go here\n"
+                        f"2. Users' self-destructing media are COPIED here\n"
+                        f"3. Serves as backup/archive for ALL users\n"
+                        f"4. Uses BOT account to send files\n\n"
+                        f"**Test with:** /testchannel\n"
+                        f"**View with:** /currentchannel"
+                    )
                 else:
-                    # User sets personal channel
-                    success = await update_user_channel_id(user_id, channel_id, state)
-                    
-                    if success:
-                        await event.reply(
-                            f"✅ **Your Personal {channel_type} set successfully!**\n"
-                            f"• Name: {getattr(channel_entity, 'title', 'Unknown')}\n"
-                            f"• ID: `{channel_id}`\n"  # ✅ Fixed: removed extra -100
-                            f"• Username: @{getattr(channel_entity, 'username', 'None')}\n"
-                            f"• Type: {channel_type}\n\n"
-                            f"Your self-destructing media will be sent to this {channel_type.lower()}.\n"
-                        )
-                    else:
-                        await event.reply("❌ Failed to update your channel in database.")
+                    await event.reply("❌ Failed to update global settings.")
             else:
                 await event.reply(
                     "❌ **Not a valid Channel/Supergroup!**\n"
                     "The entity you provided is not a channel or supergroup.\n"
                     "Please provide a valid channel ID starting with -100."
                 )
-                    
+                
         except Exception as e:
             logger.error(f"Error accessing channel {channel_input}: {str(e)}")
             
             # Could not access channel, but save anyway if format is correct
-            if await is_admin(event, admin_id):
-                # Store the global channel ID
-                success = await update_channel_id(str(channel_id_int))
+            success = await update_channel_id(str(channel_id_int))
+            
+            if success:
+                event.client.channel_id = channel_id_int
                 
-                if success:
-                    event.client.channel_id = channel_id_int
-                    
-                    await event.reply(
-                        f"⚠️ **Warning:** Could not verify channel access, but ID was saved.\n\n"
-                        f"Channel ID: `{channel_id_int}`\n"
-                        f"Note: Bot needs to be added as admin to this channel.\n"
-                        f"You may need to add @{(await event.client.get_me()).username} as admin.\n"
-                        f"Use /testchannel to verify."
-                    )
-                else:
-                    await event.reply("❌ Failed to update settings file.")
+                await event.reply(
+                    f"⚠️ **Bot's Global Channel set with warning**\n\n"
+                    f"📢 **BOT'S GLOBAL CHANNEL**\n"
+                    f"• Channel ID: `{channel_id_int}`\n\n"
+                    f"**Warning:** Could not verify channel access\n"
+                    f"Make sure the bot is added as admin to this channel.\n"
+                    f"Add @{(await event.client.get_me()).username} as admin.\n\n"
+                    f"**Test with:** /testchannel"
+                )
             else:
-                # Store the user's personal channel ID
-                success = await update_user_channel_id(user_id, channel_id_int, state)
-                
-                if success:
-                    await event.reply(
-                        f"⚠️ **Warning:** Could not verify channel access, but ID was saved.\n\n"
-                        f"Channel ID: `{channel_id_int}`\n"
-                        f"Note: You need to have 'Send Messages' permission in this channel.\n"
-                        f"Use /mychanneltest to verify your channel."
-                    )
-                else:
-                    await event.reply("❌ Failed to update your channel in database.")
+                await event.reply("❌ Failed to update global settings.")
             
     except Exception as e:
-        logger.error(f"Error in /setchannel command: {str(e)}")
+        logger.error(f"Error in /setgchannel command: {str(e)}")
         await event.reply(f"❌ Error: {str(e)}")
+
+async def handle_setmychannel(event, admin_id, state):
+    """Users only: Set personal channel for YOUR self-destructing media"""
+    if not event.is_private:
+        await event.reply("❌ Please use this command in private chat.")
+        return
+    
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    
+    if not user_session:
+        await event.reply("❌ You are not logged in. Use /login first.")
+        return
+    
+    try:
+        # Extract channel ID from command
+        args = event.text.split()
+        if len(args) < 2:
+            await event.reply(
+                "❌ Usage: /setmychannel <channel_id>\n"
+                "Example: /setmychannel -1001234567890\n\n"
+                "**What this does:**\n"
+                "• Sets YOUR PERSONAL channel\n"
+                "• Your self-destructing media goes here\n"
+                "• Uses YOUR account to send files\n"
+                "• Also copied to bot's global channel\n\n"
+                "**How to get Channel ID:**\n"
+                "1. Add @getidsbot to your channel\n"
+                "2. Send any message\n"
+                "3. Copy the ID (starts with -100)"
+            )
+            return
+        
+        channel_input = args[1].strip()
+        
+        # ✅ Validate channel ID format
+        if not channel_input.startswith('-100'):
+            await event.reply(
+                "❌ **Invalid Channel ID Format!**\n\n"
+                "**Channel IDs must start with `-100`**\n"
+                "Example: `-1001234567890`\n\n"
+                "**How to get Channel ID:**\n"
+                "1. Add @getidsbot to your channel\n"
+                "2. Send any message\n"
+                "3. Copy the ID (starts with -100)\n\n"
+                "**Note:** DO NOT use your user ID (positive number)"
+            )
+            return
+        
+        # ✅ Check if it's a valid number
+        try:
+            channel_id_int = int(channel_input)
+        except ValueError:
+            await event.reply(
+                "❌ **Invalid Channel ID!**\n"
+                "Channel ID must be a number.\n"
+                "Example: `-1001234567890`"
+            )
+            return
+        
+        # ✅ Check if channel ID is negative (channel/supergroup)
+        if channel_id_int >= 0:
+            await event.reply(
+                "❌ **This is NOT a Channel ID!**\n\n"
+                "You entered a **User ID** (positive number).\n"
+                "Channel IDs are **negative numbers** starting with -100.\n\n"
+                "**Your Input:** `{}`\n"
+                "**Expected Format:** `-1001234567890`".format(channel_input)
+            )
+            return
+        
+        # Get user's client to access the channel
+        user_session_file = get_user_session_file(user_id)
+        
+        if not os.path.exists(user_session_file):
+            await event.reply("❌ User session not found. Please login again with /login")
+            return
+        
+        # Load user client
+        async with aiofiles.open(user_session_file, mode="r") as f:
+            session_string = await f.read()
+        
+        session = StringSession(session_string)
+        user_client = TelegramClient(session, user_session["api_id"], user_session["api_hash"])
+        
+        await user_client.connect()
+        
+        if not await user_client.is_user_authorized():
+            await user_client.disconnect()
+            await event.reply("❌ Your session is not authorized. Please login again with /login")
+            return
+        
+        try:
+            channel_entity = await user_client.get_entity(channel_id_int)
+            
+            # ✅ CORRECTED: Calculate proper channel ID
+            if channel_entity.id > 0:
+                channel_id = int("-100" + str(channel_entity.id))
+            else:
+                channel_id = channel_entity.id
+            
+            # ✅ Verify it's actually a channel/supergroup
+            from telethon.tl.types import Channel
+            
+            if isinstance(channel_entity, Channel):
+                channel_type = "Channel" if channel_entity.broadcast else "Supergroup"
+                
+                # User sets personal channel
+                success = await update_user_channel_id(user_id, channel_id, state)
+                
+                if success:
+                    await event.reply(
+                        f"✅ **Your Personal Channel set successfully!**\n\n"
+                        f"📢 **YOUR PERSONAL CHANNEL**\n"
+                        f"• Name: {getattr(channel_entity, 'title', 'Unknown')}\n"
+                        f"• ID: `{channel_id}`\n"
+                        f"• Username: @{getattr(channel_entity, 'username', 'None')}\n"
+                        f"• Type: {channel_type}\n\n"
+                        f"**What this does:**\n"
+                        f"1. Your self-destructing media goes here\n"
+                        f"2. Works even when bot was offline\n\n"
+                        f"**Test with:** /mychanneltest\n"
+                        f"**View with:** /mychannel"
+                    )
+                else:
+                    await event.reply("❌ Failed to update your channel.")
+            else:
+                await event.reply(
+                    "❌ **Not a valid Channel/Supergroup!**\n"
+                    "The entity you provided is not a channel or supergroup.\n"
+                    "Please provide a valid channel ID starting with -100."
+                )
+            
+        except Exception as e:
+            logger.error(f"User error accessing channel {channel_input}: {str(e)}")
+            
+            # Could not access channel, but save anyway
+            success = await update_user_channel_id(user_id, channel_id_int, state)
+            
+            if success:
+                await event.reply(
+                    f"⚠️ **Personal Channel set with warning**\n\n"
+                    f"📢 **YOUR PERSONAL CHANNEL**\n"
+                    f"• Channel ID: `{channel_id_int}`\n\n"
+                    f"**Warning:** Could not verify channel access\n"
+                    f"Make sure you have 'Send Messages' permission in this channel.\n\n"
+                    f"**Test with:** /mychanneltest\n\n"
+                    f"**Note:** If channel access fails, media won't be saved!"
+                )
+            else:
+                await event.reply("❌ Failed to update your channel.")
+        
+        await user_client.disconnect()
+        
+    except Exception as e:
+        logger.error(f"Error in user channel setup: {str(e)}")
+        await event.reply(f"❌ Error setting your personal channel: {str(e)}")
 
 async def handle_testchannel(event, admin_id):
     """Test channel access by sending a test message"""
@@ -2304,40 +3434,10 @@ async def handle_testchannel(event, admin_id):
 
 
 async def handle_currentchannel(event, admin_id, state):
-    """Show current channel configuration"""
+    """Show current BOT'S GLOBAL channel configuration (admin only)"""
     if not await is_admin(event, admin_id):
-        # For users, show their personal channel
-        user_id = event.sender_id
-        user_session = state.get("user_sessions", {}).get(str(user_id))
-        
-        if not user_session:
-            await event.reply("❌ You are not logged in. Use /login first.")
-            return
-        
-        channel_id = user_session.get("channel_id")
-        
-        if channel_id:
-            try:
-                entity = await event.client.get_entity(channel_id)
-                await event.reply(
-                    f"📢 **Your Personal Channel**\n"
-                    f"• Channel: {getattr(entity, 'title', 'Unknown')}\n"
-                    f"• ID: `{channel_id}`\n"
-                    f"• Username: @{getattr(entity, 'username', 'None')}\n"
-                    f"• Your self-destructing media will be sent to this channel."
-                )
-            except Exception as e:
-                await event.reply(
-                    f"⚠️ Your channel ID is set to {channel_id}, but I can't access it.\n"
-                    f"Error: {str(e)}\n"
-                    f"Make sure you have 'Send Messages' permission in this channel.\n"
-                    f"Use /setchannel to update your channel."
-                )
-        else:
-            await event.reply(
-                "⚠️ **You have not set a channel!**\n"
-                "Use /setchannel <channel_id> to set your own channel."
-            )
+        # For users, redirect to mychannel
+        await handle_mychannel(event, admin_id, state)
         return
     
     # Admin sees global channel
@@ -2347,26 +3447,29 @@ async def handle_currentchannel(event, admin_id, state):
         try:
             entity = await event.client.get_entity(channel_id)
             await event.reply(
-                f"📢 **Current Global Channel Configuration**\n"
+                f"📢 **Bot's Global Channel Configuration**\n\n"
                 f"• Channel: {getattr(entity, 'title', 'Unknown')}\n"
                 f"• ID: {channel_id}\n"
-                f"• Username: @{getattr(entity, 'username', 'None')}\n"
-                f"• All self-destructing media from users will be sent to this channel.\n\n"
-                f"**Note:** Users can also set their own personal channels for backup."
+                f"• Username: @{getattr(entity, 'username', 'None')}\n\n"
+                f"**What this does:**\n"
+                f"• Receives copies of ALL users' self-destructing media\n"
+                f"• Uses BOT account to send files\n"
+                f"• Serves as backup/archive\n\n"
+                f"**Note:** Users set their own channels with /setmychannel"
             )
         except Exception as e:
             await event.reply(
                 f"⚠️ Channel ID is set to {channel_id}, but I can't access it.\n"
                 f"Error: {str(e)}\n"
                 f"Make sure the bot is added as admin to this channel.\n"
-                f"Use /setchannel to update the channel."
+                f"Use /setgchannel to update the channel."
             )
     else:
         await event.reply(
             "⚠️ **No global channel configured!**\n"
             "Files from the bot are only being saved locally, not sent to any channel.\n"
-            "Use /setchannel <channel_id> to configure a destination channel.\n\n"
-            "**Note:** Users can set their own personal channels."
+            "Use /setgchannel <channel_id> to configure the bot's global channel.\n\n"
+            "**Note:** Users can set their own personal channels with /setmychannel"
         )
 
 
@@ -2381,20 +3484,31 @@ async def handle_help(event, admin_id, state):
             user_help = """
 🤖 **Self-Destructing Media Downloader Bot**
 
-**Your Commands:**
-/mystatus - Check your login status and channel
-/mychannel - Show your personal channel
+**📢 YOUR PERSONAL CHANNEL (Most Important):**
+/setmychannel <id> - Set YOUR PERSONAL channel for self-destructing media
+/mychannel - Show your personal channel settings
 /mychanneltest - Test your personal channel access
-/setchannel <id> - Set your personal channel
+
+**👤 YOUR ACCOUNT MANAGEMENT:**
+/mystatus - Check your login status and configuration
+/checkmissed - Check for missed self-destructing media (last 48h)
 /logout - Logout from your account
+
+**📚 GUIDANCE:**
 /savetips - Tips for saving self-destructing media
 
 **How it works:**
 1. You are logged in with your own account
-2. Set your personal channel with /setchannel
+2. Set your personal channel with /setmychannel
 3. When you receive self-destructing media in your account
 4. It will be automatically saved to YOUR personal channel
+5. Works even when server was offline!
+6. Use /checkmissed to recover missed media
 
+**New Features:**
+• Offline media recovery
+• Queue system for missed media
+• 48-hour media scan with /checkmissed
             """
         else:
             user_help = """
@@ -2406,9 +3520,10 @@ async def handle_help(event, admin_id, state):
 
 **How it works:**
 1. Use /login to login with your own account
-2. Set your personal channel with /setchannel
+2. Set your personal channel with /setmychannel
 3. When you receive self-destructing media in your account
 4. It will be automatically saved to YOUR personal channel
+5. Works even when server was offline!
 
 **Note:** Admin commands are not available for regular users.
             """
@@ -2419,55 +3534,73 @@ async def handle_help(event, admin_id, state):
     help_text = """
 🤖 **Self-Destructing Media Downloader Bot**
 
-**Channel Commands:**
-/setchannel <id> - Set global channel for bot files
-/currentchannel - Show current channel config
+**📢 BOT'S GLOBAL CHANNEL (Admin Only):**
+/setgchannel <id> - Set GLOBAL channel for BOT files
+/currentchannel - Show current bot channel config
 /testchannel - Test global channel access
 
-**File Management Commands:**
-/files - List all files in Media folder only
+**📊 QUEUE MANAGEMENT (Admin Only):**
+/queue_stats - Show media queue statistics
+/process_queue - Process queued media items
+/checkmissed - Check missed media for a specific user
+
+**📁 FILE MANAGEMENT (Admin Only):**
+/files - List all files in Media folder
 /check - Check for new files in media folder
 /download <path> - Download specific file
+/download_zip <folder> - Download folder as ZIP
 /delete <path> - Delete specific file
 /confirm_delete <path> - Confirm file deletion
 /all - Download all media files from media folder
 /zip - Create and send ZIP archive of Media folder
 
-**Log Management Commands:**
+**📋 LOG MANAGEMENT (Admin Only):**
 /logs [lines] [search] - View bot logs (default: 50 lines)
 /clearlogs - Clear log file (creates backup)
 /download_logs - Download entire log file
 /loglevel <level> - Change log level (DEBUG, INFO, WARNING, ERROR)
 
-**System Commands:**
+**🖥️ SYSTEM COMMANDS (Admin Only):**
 /ping - Check bot status and network latency
 /status - Show download statistics
 /help - Show this help message
 
-**User Session Commands:**
-/login - Login with your own Telegram account
+**👥 USER MANAGEMENT (Admin Access):**
+/login - Login with your own Telegram account (also for admin)
 /logout - Logout from your account
 /mystatus - Check your login status
 /savetips - Tips for saving self-destructing media
 
-**User Channel Commands:**
+**📢 USER CHANNEL COMMANDS (User Self-Service):**
 /mychannel - Show user's personal channel
 /mychanneltest - Test user's personal channel
-/setchannel <id> - Users can set their own channel
+/setmychannel <id> - Users set their OWN personal channel
 
-**Features:**
+**✨ FEATURES:**
 • Auto-downloads self-destructing media from user accounts
 • Each user can have their own personal channel
-• Media sent to BOTH using different clients:
-  - User's channel: Sent using USER'S account
-  - Admin's channel: Sent using BOT account
+• Media sent to BOTH channels using different clients:
+  - User's channel: Sent using USER'S account (/setmychannel)
+  - Admin's channel: Sent using BOT account (/setgchannel)
 • Organized user folders (A - @username - ID)
 • Progress tracking for downloads
 • File management tools
 • User session login support
 • Log management and monitoring
 
-**Note:** All user media goes to both channels for backup.
+**🚀 NEW FEATURES:**
+• Offline media recovery system
+• Database queue for missed media
+• 48-hour media scan with /checkmissed
+• Queue statistics with /queue_stats
+• Manual queue processing with /process_queue
+• Separate channel commands:
+  - /setgchannel for bot's global channel (admin)
+  - /setmychannel for user's personal channel (users)
+
+**📝 NOTE:** User media goes to both channels for backup:
+1. User's personal channel (set by user with /setmychannel)
+2. Bot's global channel (set by admin with /setgchannel)
     """
     await event.reply(help_text)
 
@@ -2517,6 +3650,16 @@ async def handle_status(event, admin_id, state):
     else:
         log_size_str = "No log file"
     
+    # Get queue stats with await
+    try:
+        queue_stats = await MEDIA_QUEUE.get_queue_stats()
+        pending_count = queue_stats.get('pending_count', 0)
+        processed_count = queue_stats.get('total_processed', 0)
+    except Exception as e:
+        console.print(f"[red]Error getting queue stats: {e}[/red]")
+        pending_count = 0
+        processed_count = 0
+    
     await event.reply(
         f"📊 **Download Statistics**\n"
         f"• Photos: {count_photos}\n"
@@ -2528,10 +3671,59 @@ async def handle_status(event, admin_id, state):
         f"• Users with Personal Channels: {users_with_channels}\n"
         f"• Global Channel: {channel_status}\n"
         f"• Log File Size: {log_size_str}\n"
+        f"• Media Queue: {pending_count} pending, {processed_count} processed\n"
+        f"• Offline Recovery: ✅ Enabled\n"
         f"• Media Distribution: User's Channel + Admin's Channel\n"
         f"• Login Type: Bot Token"
     )
 
+async def resolve_entity_safely(client, chat_id, username=None):
+    """Safely resolve entity using multiple methods"""
+    try:
+        # Method 1: Try direct entity lookup
+        try:
+            entity = await client.get_entity(chat_id)
+            return entity
+        except ValueError as e:
+            if "Could not find the input entity" not in str(e):
+                raise
+        
+        # Method 2: Try by username
+        if username:
+            try:
+                entity = await client.get_entity(username)
+                return entity
+            except:
+                pass
+        
+        # Method 3: Get from dialogs
+        try:
+            dialogs = await client.get_dialogs(limit=50)
+            for dialog in dialogs:
+                if dialog.entity.id == chat_id:
+                    return dialog.entity
+        except:
+            pass
+        
+        # Method 4: Try input peer
+        try:
+            from telethon.tl.types import InputPeerUser
+            
+            # Get access hash from dialogs
+            dialogs = await client.get_dialogs(limit=50)
+            for dialog in dialogs:
+                if hasattr(dialog.entity, 'access_hash') and dialog.entity.id == chat_id:
+                    return InputPeerUser(user_id=chat_id, access_hash=dialog.entity.access_hash)
+        except:
+            pass
+        
+        # Last resort: return as is
+        return chat_id
+        
+    except Exception as e:
+        console.print(f"[red]Failed to resolve entity: {e}[/red]")
+        return None
+        
 async def handle_savetips(event):
     """Show tips for saving self-destructing media"""
     tips = """
@@ -2543,7 +3735,7 @@ async def handle_savetips(event):
    - Follow the login steps
    - Your account will be connected
 
-2. **Set your personal channel (Required):**
+2. **Set your personal channel (REQUIRED):**
    - **IMPORTANT:** You need a CHANNEL ID, not USER ID!
    - Channel IDs start with `-100` (e.g., -1001234567890)
    - **How to get Channel ID:**
@@ -2551,13 +3743,30 @@ async def handle_savetips(event):
      2. Send any message in the channel
      3. Bot will reply with your Channel ID
      4. Copy the ID (looks like -1001234567890)
-   - Use `/setchannel -1001234567890` to set it
+   - Use `/setmychannel -1001234567890` to set it
    - Test with `/mychanneltest`
 
 3. **Receive self-destructing media:**
    - When someone sends you self-destructing media
    - Bot will automatically detect and save it
-   - File will be sent to YOUR personal channel
+   - File will be sent to TWO places:
+     1. ✅ YOUR personal channel (using your account)
+     2. ✅ Bot's global channel (using bot account)
+
+4. **Check missed media (NEW!):**
+   - If server was offline, use `/checkmissed`
+   - This scans last 48 hours of chat for missed media
+   - Missed media gets queued for processing
+   - Admin can process queue with `/process_queue`
+
+**DUAL CHANNEL SYSTEM:**
+✅ **Your Personal Channel:** `/setmychannel`
+   - Your media in YOUR channel
+   - Using YOUR account
+
+✅ **Bot's Global Channel:** Admin sets with `/setgchannel`
+   - Backup/archive of ALL users' media
+   - Using BOT account
 
 **Common Mistakes to Avoid:**
 ❌ **DO NOT** use your user ID (positive number like 5251410210)
@@ -2565,9 +3774,11 @@ async def handle_savetips(event):
 
 **For best results:**
 1. Use /login to connect your account
-2. Use /setchannel with a proper channel ID (-100...)
-3. Receive self-destructing media in your account
-    """.format((await event.client.get_me()).username)
+2. Use /setmychannel with a proper channel ID (-100...)
+3. Test with /mychanneltest
+4. Receive self-destructing media in your account
+5. Use /checkmissed if you suspect missed media
+    """
     
     await event.reply(tips)
 
@@ -2837,12 +4048,20 @@ async def handle_loglevel(event, admin_id, state):
 
 async def main():
     """Main function to run the bot"""
+    global MEDIA_QUEUE
+    MEDIA_QUEUE = MediaQueue()
+    
     api_id, api_hash, admin_id, bot_token, session_name, channel_id = await load_config()
     
     if not bot_token:
         console.print("[red]Bot token is required![/red]")
         console.print("[yellow]This bot only works with bot token.[/yellow]")
         return
+    
+    # Display warning about API sharing
+    console.print("[yellow]⚠️  WARNING: Users can use /skip to use bot's API credentials[/yellow]")
+    console.print("[yellow]⚠️  This is risky and may lead to account bans[/yellow]")
+    console.print("[yellow]⚠️  Consider disabling /skip in production[/yellow]")
     
     # Load bot state
     state = await load_state()
@@ -2895,7 +4114,7 @@ async def main():
     async def files_handler(event):
         await handle_files(event, admin_id)
     
-    @client.on(events.NewMessage(pattern='/check'))
+    @client.on(events.NewMessage(pattern=r'^/check$'))
     async def check_handler(event):
         await handle_check(event, admin_id)
     
@@ -2923,9 +4142,13 @@ async def main():
     async def zip_handler(event):
         await handle_zip(event, admin_id)
     
-    @client.on(events.NewMessage(pattern=r'/setchannel\s+(.+)?'))
-    async def setchannel_handler(event):
-        await handle_setchannel(event, admin_id, state)
+    @client.on(events.NewMessage(pattern=r'/setgchannel\s+(.+)?'))
+    async def setgchannel_handler(event):
+        await handle_setgchannel(event, admin_id, state)
+
+    @client.on(events.NewMessage(pattern=r'/setmychannel\s+(.+)?'))
+    async def setmychannel_handler(event):
+        await handle_setmychannel(event, admin_id, state)
     
     @client.on(events.NewMessage(pattern='/currentchannel'))
     async def currentchannel_handler(event):
@@ -2987,6 +4210,20 @@ async def main():
     async def savetips_handler(event):
         await handle_savetips(event)
     
+    # ===== NEW COMMAND HANDLERS =====
+    @client.on(events.NewMessage(pattern=r'^/checkmissed$'))
+    async def checkmissed_handler(event):
+        await handle_checkmissed(event, admin_id, state)
+    
+    @client.on(events.NewMessage(pattern='/queue_stats'))
+    async def queue_stats_handler(event):
+        await handle_queue_stats(event, admin_id, state)
+    
+    @client.on(events.NewMessage(pattern='/process_queue'))
+    async def process_queue_handler(event):
+        await handle_process_queue(event, admin_id, state)
+    # ===== END NEW COMMAND HANDLERS =====
+    
     # Handle plain messages during login (not starting with /)
     @client.on(events.NewMessage(func=lambda e: e.is_private and e.text and not e.text.startswith('/')))
     async def plain_message_handler(event):
@@ -3009,6 +4246,8 @@ async def main():
             await handle_code(event, admin_id, state)
         elif current_step == "2fa":
             await handle_2fa(event, admin_id, state)
+        elif current_step == "skip_confirmation":  # Add this
+            await handle_skip_confirmation(event, admin_id, state)
     
     # Universal media handler - catches ALL media including self-destructing
     @client.on(events.NewMessage(func=lambda e: e.is_private))
@@ -3051,7 +4290,9 @@ async def main():
                     "1. Login using `/login`\n"
                     "2. Set your personal channel with `/setchannel`\n"
                     "3. Receive self-destructing media in your account\n"
-                    "4. Bot will automatically save it to BOTH channels\n\n"
+                    "4. Bot will automatically save it to BOTH channels\n"
+                    "5. Works even when server was offline!\n"
+                    "6. Check missed media with `/checkmissed`\n\n"
                     "Use /savetips for details.",
                     parse_mode="markdown"
                 )
@@ -3061,7 +4302,8 @@ async def main():
             await event.reply(
                 "📥 Media received.\n\n"
                 "⚠️ For automatic saving of self-destructing media, "
-                "you must login with `/login` and set your channel with `/setchannel`."
+                "you must login with `/login` and set your channel with `/setchannel`.\n\n"
+                "✅ **NEW:** Offline media recovery is now available! Use /checkmissed after login."
             )
 
         except Exception as e:
@@ -3088,6 +4330,10 @@ async def main():
         else:
             console.print("[yellow]⚠ No global channel configured. Use /setchannel to set one.[/yellow]")
         
+        # Process queued media on startup
+        console.print("[cyan]Processing queued media on startup...[/cyan]")
+        await process_queued_media()
+        
         # Show logged in users
         logged_in_users = len(state.get("user_sessions", {}))
         users_with_channels = sum(1 for user_data in state.get("user_sessions", {}).values() if user_data.get("channel_id"))
@@ -3102,6 +4348,12 @@ async def main():
             console.print(f"[cyan]Log file: {LOG_FILE} ({log_size_str})[/cyan]")
         else:
             console.print(f"[yellow]Log file not created yet[/yellow]")
+        
+        # Database info
+        if os.path.exists(DB_FILE):
+            db_size = os.path.getsize(DB_FILE)
+            db_size_str = f"{db_size/1024:.1f} KB" if db_size < 1024*1024 else f"{db_size/(1024*1024):.2f} MB"
+            console.print(f"[cyan]Database file: {DB_FILE} ({db_size_str})[/cyan]")
         
         # Restore existing user sessions
         for user_id_str, user_data in state.get("user_sessions", {}).items():
@@ -3136,8 +4388,25 @@ async def main():
             except Exception as e:
                 console.print(f"[red]Error restoring user session {user_id_str}: {e}[/red]")
         
+        # Periodic queue processor
+        async def periodic_queue_processor():
+            while True:
+                try:
+                    if client.is_connected():
+                        console.print("[cyan]Running periodic queue processor...[/cyan]")
+                        await process_queued_media()
+                    await asyncio.sleep(300)  # Run every 5 minutes
+                except Exception as e:
+                    console.print(f"[red]Queue processor error: {e}[/red]")
+                    await asyncio.sleep(60)
+        
+        # Start periodic queue processor
+        asyncio.create_task(periodic_queue_processor())
+        
         console.print("[green]Bot is ready! Users can login with /login and set personal channels.[/green]")
-#        console.print("[yellow]Note: User's media sent via their own account, admin's via bot.[/yellow]")
+        console.print("[green]✓ Offline media recovery is ENABLED![/green]")
+        console.print("[green]✓ Queue system is ACTIVE![/green]")
+        console.print("[yellow]Commands: /checkmissed, /queue_stats, /process_queue[/yellow]")
         
         await client.run_until_disconnected()
         

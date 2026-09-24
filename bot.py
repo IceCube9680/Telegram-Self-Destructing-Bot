@@ -1,96 +1,434 @@
 # -*- coding:utf-8 -*-
+"""
+Telegram Self-Destructing Media Downloader Bot
+Production-Grade Hardened Implementation
+"""
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import random
+import re
+import secrets
+import shutil
 import string
+import sys
 import time
 import zipfile
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Set, Any, List, Dict, Union, Tuple, cast
+
 import aiofiles
 import aiohttp
 import threading
+from cryptography.fernet import Fernet, InvalidToken
+from dotenv import load_dotenv
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    DownloadColumn,
+    TransferSpeedColumn,
+    TimeRemainingColumn
+)
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
-from telethon.errors import UserIsBlockedError, PeerIdInvalidError
+from telethon.errors import (
+    FloodWaitError,
+    UserIsBlockedError,
+    PeerIdInvalidError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
+    UserNotMutualContactError,
+    AuthKeyUnregisteredError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PasswordHashInvalidError
+)
 
-# Define and create necessary directories
-all_media_dir = "Media"
-if not os.path.exists(all_media_dir):
-    os.makedirs(all_media_dir)
+# Load environment variables
+load_dotenv()
 
-# Configure logging
-LOG_FILE = "bot.log"
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+# Base directories and files
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MEDIA_DIR = os.path.join(BASE_DIR, "Media")
+SESSIONS_DIR = os.path.join(BASE_DIR, "user_sessions")
+BACKUPS_DIR = os.path.join(BASE_DIR, "backups")
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
-# Console handler
-console_handler = logging.StreamHandler()
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+DB_FILE = os.path.join(BASE_DIR, "bot_queue.db")
+LOG_FILE = os.path.join(BASE_DIR, "bot.log")
+
+# Create required directories with safe permissions
+for d in [MEDIA_DIR, SESSIONS_DIR, BACKUPS_DIR, LOGS_DIR]:
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+
+# Setup logging with log rotation
+log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
+
+formatter = logging.Formatter("%(asctime)s - [%(levelname)s] - %(name)s - %(message)s")
+
+console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(log_level)
 
-# File handler
-file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+file_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=5,
+    encoding='utf-8'
+)
 file_handler.setFormatter(formatter)
-file_handler.setLevel(logging.INFO)
+file_handler.setLevel(log_level)
 
-# Setup logger
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger = logging.getLogger("SelfDestructBot")
+logger.setLevel(log_level)
+# Remove any existing handlers to avoid duplicates
+logger.handlers.clear()
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
 console = Console()
-SETTINGS_FILE = "settings.json"
-STATE_FILE = "bot_state.json"
-SESSIONS_DIR = "user_sessions"
-DB_FILE = "bot_queue.db"  # Database for media queue
 
-if not os.path.exists(SESSIONS_DIR):
-    os.makedirs(SESSIONS_DIR)
-
-# Store bot credentials globally for skip function
-#BOT_API_ID = None
-#BOT_API_HASH = None
-# Store active user clients
-ACTIVE_USER_CLIENTS = {}
-# Store bot client globally
-BOT_CLIENT = None
-# Media queue instance
+# Global runtime state
+ACTIVE_USER_CLIENTS: Dict[str, TelegramClient] = {}
+BOT_CLIENT: Optional[TelegramClient] = None
 MEDIA_QUEUE = None
+BOT_CONFIG: Optional[Dict[str, Any]] = None
+CONFIGURED_ADMIN_ID: Optional[int] = None
+FERNET_CIPHER: Optional[Fernet] = None
 
-# Add a global variable for bot config
-BOT_CONFIG = None
+# Backward-compatibility alias
+all_media_dir = MEDIA_DIR
 
-# ===== DATABASE CLASS =====
+
+# =====================================================================
+# PATH SANITIZATION & SECURITY HELPERS
+# =====================================================================
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitize a filename to prevent path traversal and illegal characters."""
+    if not filename:
+        return "unnamed_file.bin"
+    # Strip null bytes and directory components
+    cleaned = filename.replace('\x00', '')
+    cleaned = os.path.basename(cleaned.replace('\\', '/'))
+    cleaned = re.sub(r'[\r\n\t]', '', cleaned)
+    cleaned = re.sub(r'[^a-zA-Z0-9._\- ]', '_', cleaned)
+    # Prevent leading/trailing dots
+    cleaned = cleaned.strip('. ')
+    return cleaned if cleaned else "unnamed_file.bin"
+
+
+def sanitize_folder_name(name: str) -> str:
+    """Sanitize folder component to prevent path traversal."""
+    if not name:
+        return "unknown"
+    cleaned = name.replace('\x00', '')
+    cleaned = os.path.basename(cleaned.replace('\\', '/'))
+    cleaned = re.sub(r'[^a-zA-Z0-9._\- @]', '_', cleaned)
+    cleaned = cleaned.strip('. ')
+    return cleaned if cleaned else "unknown"
+
+
+def is_safe_media_path(target_path: str, base_dir: str = MEDIA_DIR) -> bool:
+    """Ensure target_path resolves strictly within base_dir."""
+    try:
+        real_base = os.path.realpath(base_dir)
+        real_target = os.path.realpath(target_path)
+        return real_target.startswith(real_base) and real_target != real_base
+    except Exception:
+        return False
+
+
+def resolve_safe_media_path(user_input_path: str, base_dir: str = MEDIA_DIR) -> Optional[str]:
+    """Safely resolve user input path into a verified path within MEDIA_DIR."""
+    if not user_input_path:
+        return None
+    raw = user_input_path.strip().strip('"\'')
+    if '\x00' in raw:
+        return None
+    
+    # Normalize path
+    if os.path.isabs(raw):
+        candidate = os.path.normpath(raw)
+    else:
+        # Check if user passed "Media/..." or relative path
+        if raw.startswith("Media/") or raw.startswith("Media\\"):
+            candidate = os.path.normpath(os.path.join(BASE_DIR, raw))
+        else:
+            candidate = os.path.normpath(os.path.join(base_dir, raw))
+            
+    if is_safe_media_path(candidate, base_dir):
+        return candidate
+    return None
+
+
+# =====================================================================
+# CENTRALIZED AUTHORIZATION HELPERS
+# =====================================================================
+
+def parse_admin_id(raw_admin_id: Any) -> Optional[int]:
+    """Parse and validate an ADMIN_ID as a positive numeric Telegram user ID."""
+    if raw_admin_id is None:
+        return None
+    raw_str = str(raw_admin_id).strip().strip('"\'')
+    if not raw_str:
+        return None
+    try:
+        val = int(raw_str)
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_allowed_users(raw_allowed_users: Any) -> Set[int]:
+    """Safely parse comma-separated ALLOWED_USERS into a set of numeric IDs."""
+    if not raw_allowed_users:
+        return set()
+    raw_str = str(raw_allowed_users).strip().strip('"\'')
+    if not raw_str:
+        return set()
+    result = set()
+    for item in raw_str.split(','):
+        clean_item = item.strip().strip('"\'')
+        if clean_item:
+            try:
+                val = int(clean_item)
+                if val > 0:
+                    result.add(val)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid user ID in ALLOWED_USERS: {clean_item}")
+    return result
+
+
+def extract_user_id(user_id_or_event: Any) -> Optional[int]:
+    """Extract numeric Telegram user ID from an event, int, or str."""
+    if user_id_or_event is None:
+        return None
+    if isinstance(user_id_or_event, int):
+        return user_id_or_event if user_id_or_event > 0 else None
+    if hasattr(user_id_or_event, 'sender_id'):
+        sender_id = user_id_or_event.sender_id
+        if sender_id is not None:
+            try:
+                val = int(sender_id)
+                return val if val > 0 else None
+            except (ValueError, TypeError):
+                return None
+    try:
+        raw_str = str(user_id_or_event).strip().strip('"\'')
+        val = int(raw_str)
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def is_admin_id(user_id_or_event: Any, admin_id: Optional[Any] = None) -> bool:
+    """Synchronous check if user is the configured administrator."""
+    target_admin = parse_admin_id(admin_id) if admin_id is not None else CONFIGURED_ADMIN_ID
+    if target_admin is None:
+        target_admin = parse_admin_id(os.getenv("ADMIN_ID"))
+    if target_admin is None:
+        return False
+    user_id = extract_user_id(user_id_or_event)
+    if user_id is None:
+        return False
+    return user_id == target_admin
+
+
+async def is_admin(user_id_or_event: Any, admin_id: Optional[Any] = None) -> bool:
+    """Check if sender or user_id is the configured administrator."""
+    return is_admin_id(user_id_or_event, admin_id)
+
+
+async def is_allowed_user(user_id_or_event: Any) -> bool:
+    """Check if user exists in ALLOWED_USERS environment variable or is active in SQLite database."""
+    user_id = extract_user_id(user_id_or_event)
+    if user_id is None:
+        return False
+    
+    # 1. Check ALLOWED_USERS environment variable
+    env_users = parse_allowed_users(os.getenv("ALLOWED_USERS", ""))
+    if user_id in env_users:
+        return True
+    
+    # 2. Check SQLite database allowed_users table where is_active = 1
+    if MEDIA_QUEUE:
+        try:
+            conn = MEDIA_QUEUE._get_connection()
+            try:
+                c = conn.cursor()
+                c.execute(
+                    "SELECT user_id FROM allowed_users WHERE user_id = ? AND is_active = 1",
+                    (user_id,)
+                )
+                row = c.fetchone()
+                return row is not None
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"Error checking allowed_users database: {e}")
+            return False
+            
+    return False
+
+
+async def is_authorized(user_id_or_event: Any, admin_id: Optional[Any] = None) -> bool:
+    """Authoritative centralized authorization check.
+    Hierarchy:
+    1. Admin (ADMIN_ID) -> ALWAYS authorized (regardless of database record or state)
+    2. Explicitly Allowed User (ALLOWED_USERS env or active in database) -> Authorized
+    3. Everything else -> Denied
+    """
+    user_id = extract_user_id(user_id_or_event)
+    if user_id is None:
+        logger.warning(f"Authorization denied for invalid/null user_id={user_id_or_event}")
+        return False
+    
+    # Step 1: Admin check (FIRST and authoritative - bypasses any DB restriction)
+    if is_admin_id(user_id, admin_id):
+        return True
+    
+    # Step 2: Allowed user check
+    if await is_allowed_user(user_id):
+        return True
+    
+    # Step 3: Deny
+    logger.warning(f"Authorization denied for user_id={user_id}")
+    return False
+
+
+# =====================================================================
+# APPLICATION & DATABASE ENCRYPTION
+# =====================================================================
+
+def init_encryption(key_env: Optional[str] = None) -> Fernet:
+    """Initialize Fernet encryption with deterministic key derivation and safety checks."""
+    global FERNET_CIPHER
+    
+    raw_key = key_env or os.getenv("ENCRYPTION_KEY")
+    if raw_key:
+        raw_key = raw_key.strip().strip('"\'')
+        # Check if already a valid 32-byte urlsafe base64 key (44 chars)
+        try:
+            decoded = base64.urlsafe_b64decode(raw_key.encode('utf-8'))
+            if len(decoded) == 32:
+                FERNET_CIPHER = Fernet(raw_key.encode('utf-8'))
+                return FERNET_CIPHER
+        except Exception:
+            pass
+        
+        # Deterministically derive 32-byte key using SHA-256
+        key_hash = hashlib.sha256(raw_key.encode('utf-8')).digest()
+        derived_key = base64.urlsafe_b64encode(key_hash)
+        FERNET_CIPHER = Fernet(derived_key)
+        return FERNET_CIPHER
+    
+    # Check if existing session files or encrypted database rows exist
+    existing_sessions = [f for f in os.listdir(SESSIONS_DIR) if f.endswith('.session')] if os.path.exists(SESSIONS_DIR) else []
+    
+    if existing_sessions:
+        logger.critical(
+            "CRITICAL: ENCRYPTION_KEY is not set, but existing user sessions were found! "
+            "Generating a new key would make existing sessions unrecoverable. "
+            "Please configure ENCRYPTION_KEY in your .env file or generate one using 'python3 generate_key.py --write'."
+        )
+        raise RuntimeError("ENCRYPTION_KEY missing while encrypted sessions exist. Aborting to prevent data loss.")
+    
+    # Fresh setup without key - generate temporary fallback key
+    logger.warning("⚠️ ENCRYPTION_KEY not set in environment. Generating a temporary key for this session.")
+    logger.warning("⚠️ Please run 'python3 generate_key.py --write' to persist a key before production use.")
+    temp_key = Fernet.generate_key()
+    FERNET_CIPHER = Fernet(temp_key)
+    return FERNET_CIPHER
+
+
+# Initialize cipher on module load
+FERNET_CIPHER = init_encryption()
+
+
+def encrypt_data(data: str) -> str:
+    """Encrypt sensitive data using Fernet."""
+    if not data:
+        return ""
+    if FERNET_CIPHER is None:
+        init_encryption()
+    encrypted = FERNET_CIPHER.encrypt(data.encode('utf-8'))
+    return encrypted.decode('utf-8')
+
+
+def decrypt_data(encrypted_data: str) -> str:
+    """Decrypt sensitive data with safe error handling."""
+    if not encrypted_data:
+        return ""
+    if FERNET_CIPHER is None:
+        init_encryption()
+    try:
+        decrypted = FERNET_CIPHER.decrypt(encrypted_data.encode('utf-8'))
+        return decrypted.decode('utf-8')
+    except InvalidToken:
+        logger.error("Failed to decrypt data: Invalid encryption key or corrupted ciphertext.")
+        return ""
+    except Exception as e:
+        logger.error(f"Decryption error: {e}")
+        return ""
+
+
+# =====================================================================
+# DATABASE CLASS WITH WAL & THREAD SAFETY
+# =====================================================================
+
 class MediaQueue:
-    """Database-based queue for pending media - FIXED VERSION"""
+    """Database-based queue for pending media with encryption support and thread safety"""
     
     def __init__(self):
         self._lock = threading.RLock()
         self.init_database()
+        self.reset_stale_processing()
     
-    def _get_connection(self):
-        """Get thread-safe database connection"""
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get thread-safe database connection with WAL mode."""
         with self._lock:
             conn = sqlite3.connect(DB_FILE, timeout=30.0, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
+            
+            # Optional SQLCipher DB key if supported by SQLite build
+            encryption_key = os.getenv("DB_ENCRYPTION_KEY")
+            if encryption_key:
+                safe_key = encryption_key.strip().replace("'", "''")
+                try:
+                    conn.execute(f"PRAGMA key='{safe_key}'")
+                except sqlite3.OperationalError:
+                    pass
+            
             return conn
     
     def init_database(self):
-        """Initialize SQLite database for media queue"""
+        """Initialize SQLite database schema and indexes."""
         conn = None
         try:
             conn = self._get_connection()
             c = conn.cursor()
             
-            # Create media_queue table
+            # 1. media_queue table
             c.execute('''
                 CREATE TABLE IF NOT EXISTS media_queue (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,7 +451,7 @@ class MediaQueue:
                 )
             ''')
             
-            # Create processed_media table
+            # 2. processed_media table
             c.execute('''
                 CREATE TABLE IF NOT EXISTS processed_media (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +467,7 @@ class MediaQueue:
                 )
             ''')
             
-            # Create last_seen table
+            # 3. last_seen table
             c.execute('''
                 CREATE TABLE IF NOT EXISTS last_seen (
                     user_id INTEGER,
@@ -140,19 +478,21 @@ class MediaQueue:
                 )
             ''')
             
-            # Create indexes
+            # 4. allowed_users table for access control
             c.execute('''
-                CREATE INDEX IF NOT EXISTS idx_media_queue_user_status 
-                ON media_queue(user_id, status)
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    added_by INTEGER,
+                    added_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT 1
+                )
             ''')
-            c.execute('''
-                CREATE INDEX IF NOT EXISTS idx_media_queue_status 
-                ON media_queue(status)
-            ''')
-            c.execute('''
-                CREATE INDEX IF NOT EXISTS idx_last_seen_user_chat 
-                ON last_seen(user_id, chat_id)
-            ''')
+            
+            # Indexes
+            c.execute('CREATE INDEX IF NOT EXISTS idx_media_queue_user_status ON media_queue(user_id, status)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_media_queue_status ON media_queue(status)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_last_seen_user_chat ON last_seen(user_id, chat_id)')
             
             conn.commit()
             console.print("[green]✓ Database initialization complete[/green]")
@@ -164,10 +504,27 @@ class MediaQueue:
             if conn:
                 conn.close()
     
+    def reset_stale_processing(self):
+        """Reset items stuck in 'processing' state back to 'pending' on startup."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            c.execute("UPDATE media_queue SET status = 'pending' WHERE status = 'processing'")
+            reset_count = c.rowcount
+            conn.commit()
+            if reset_count > 0:
+                logger.info(f"Reset {reset_count} stale in-flight queue items back to 'pending'.")
+        except Exception as e:
+            logger.error(f"Error resetting stale processing items: {e}")
+        finally:
+            if conn:
+                conn.close()
+    
     async def add_to_queue(self, user_id: int, session_string: str, api_id: int, api_hash: str,
-                    message_id: int, chat_id: int, media_type: str, sender_username: str = None,
-                    sender_id: int = None, ttl_seconds: int = None):
-        """Add media to queue for offline processing"""
+                           message_id: int, chat_id: int, media_type: str, sender_username: str = None,
+                           sender_id: int = None, ttl_seconds: int = None) -> Optional[int]:
+        """Add media to queue for processing with encrypted sensitive data."""
         conn = None
         try:
             conn = self._get_connection()
@@ -180,8 +537,11 @@ class MediaQueue:
             ''', (user_id, message_id, chat_id))
             
             if c.fetchone():
-                console.print(f"[yellow]Media already in queue (user {user_id}, message {message_id})[/yellow]")
                 return None
+            
+            # Encrypt sensitive credentials before storing in DB
+            encrypted_session = encrypt_data(session_string)
+            encrypted_api_hash = encrypt_data(api_hash)
             
             # Insert new record
             c.execute('''
@@ -189,26 +549,24 @@ class MediaQueue:
                 (user_id, session_string, api_id, api_hash, message_id, chat_id, 
                  media_type, sender_username, sender_id, status, ttl_seconds, download_time)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, CURRENT_TIMESTAMP)
-            ''', (user_id, session_string, api_id, api_hash, message_id, chat_id, 
+            ''', (user_id, encrypted_session, api_id, encrypted_api_hash, message_id, chat_id, 
                   media_type, sender_username, sender_id, ttl_seconds))
             
             queue_id = c.lastrowid
             conn.commit()
             
-            console.print(f"[green]✓ Media added to queue (ID: {queue_id})[/green]")
             logger.info(f"Media added to queue: ID {queue_id} for user {user_id}")
             return queue_id
             
         except Exception as e:
-            console.print(f"[red]Error adding to queue: {e}[/red]")
             logger.error(f"Error adding to queue: {e}")
             return None
         finally:
             if conn:
                 conn.close()
     
-    async def get_pending_media(self, limit: int = 20) -> list:
-        """Get pending media items for processing"""
+    async def get_pending_media(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get pending media items across all users with decrypted credentials."""
         conn = None
         try:
             conn = self._get_connection()
@@ -223,18 +581,58 @@ class MediaQueue:
             ''', (limit,))
             
             rows = c.fetchall()
-            return [dict(row) for row in rows]
+            result = []
+            for row in rows:
+                item = dict(row)
+                if item.get('session_string'):
+                    item['session_string'] = decrypt_data(item['session_string'])
+                if item.get('api_hash'):
+                    item['api_hash'] = decrypt_data(item['api_hash'])
+                result.append(item)
             
+            return result
         except Exception as e:
-            console.print(f"[red]Error getting pending media: {e}[/red]")
             logger.error(f"Error getting pending media: {e}")
             return []
         finally:
             if conn:
                 conn.close()
     
-    async def update_status(self, queue_id: int, status: str, retry_count: int = None):
-        """Update media queue status"""
+    async def get_pending_media_for_user(self, user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get pending media items for a specific user with decrypted credentials."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            
+            c.execute('''
+                SELECT * FROM media_queue 
+                WHERE status = 'pending' AND user_id = ?
+                ORDER BY download_time ASC 
+                LIMIT ?
+            ''', (user_id, limit))
+            
+            rows = c.fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                if item.get('session_string'):
+                    item['session_string'] = decrypt_data(item['session_string'])
+                if item.get('api_hash'):
+                    item['api_hash'] = decrypt_data(item['api_hash'])
+                result.append(item)
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error getting pending media for user {user_id}: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+    
+    async def update_status(self, queue_id: int, status: str, retry_count: Optional[int] = None) -> bool:
+        """Update media queue status."""
         conn = None
         try:
             conn = self._get_connection()
@@ -255,7 +653,6 @@ class MediaQueue:
             
             conn.commit()
             return True
-            
         except Exception as e:
             logger.error(f"Error updating queue status: {e}")
             return False
@@ -264,9 +661,9 @@ class MediaQueue:
                 conn.close()
     
     async def mark_as_processed(self, queue_id: int, user_id: int, message_id: int, chat_id: int,
-                         media_type: str, sender_username: str = None, channel_sent: bool = False,
-                         file_path: str = None):
-        """Mark media as processed"""
+                                media_type: str, sender_username: str = None, channel_sent: bool = False,
+                                file_path: str = None) -> bool:
+        """Mark media as processed in both processed_media and media_queue."""
         conn = None
         try:
             conn = self._get_connection()
@@ -280,15 +677,9 @@ class MediaQueue:
             ''', (queue_id, user_id, message_id, chat_id, media_type, 
                   sender_username, channel_sent, file_path))
             
-            c.execute('''
-                UPDATE media_queue 
-                SET status = 'processed' 
-                WHERE id = ?
-            ''', (queue_id,))
-            
+            c.execute("UPDATE media_queue SET status = 'processed' WHERE id = ?", (queue_id,))
             conn.commit()
             return True
-            
         except Exception as e:
             logger.error(f"Error marking as processed: {e}")
             return False
@@ -296,22 +687,19 @@ class MediaQueue:
             if conn:
                 conn.close()
     
-    async def update_last_seen(self, user_id: int, chat_id: int, last_message_id: int):
-        """Update last seen message for a user in a chat"""
+    async def update_last_seen(self, user_id: int, chat_id: int, last_message_id: int) -> bool:
+        """Update last seen message ID for a user in a specific chat."""
         conn = None
         try:
             conn = self._get_connection()
             c = conn.cursor()
-            
             c.execute('''
                 INSERT OR REPLACE INTO last_seen 
                 (user_id, chat_id, last_message_id, last_check)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
             ''', (user_id, chat_id, last_message_id))
-            
             conn.commit()
             return True
-            
         except Exception as e:
             logger.error(f"Error updating last seen: {e}")
             return False
@@ -319,21 +707,15 @@ class MediaQueue:
             if conn:
                 conn.close()
     
-    async def get_last_seen(self, user_id: int, chat_id: int):
-        """Get last seen message ID for a user in a chat"""
+    async def get_last_seen(self, user_id: int, chat_id: int) -> int:
+        """Get last seen message ID for a user in a specific chat."""
         conn = None
         try:
             conn = self._get_connection()
             c = conn.cursor()
-            
-            c.execute('''
-                SELECT last_message_id FROM last_seen 
-                WHERE user_id = ? AND chat_id = ?
-            ''', (user_id, chat_id))
-            
+            c.execute('SELECT last_message_id FROM last_seen WHERE user_id = ? AND chat_id = ?', (user_id, chat_id))
             result = c.fetchone()
             return result[0] if result else 0
-            
         except Exception as e:
             logger.error(f"Error getting last seen: {e}")
             return 0
@@ -341,128 +723,213 @@ class MediaQueue:
             if conn:
                 conn.close()
     
-    async def get_queue_stats(self):
-        """Get queue statistics"""
+    async def get_queue_stats(self) -> Dict[str, Any]:
+        """Get queue statistics summary."""
         conn = None
         try:
             conn = self._get_connection()
             c = conn.cursor()
-            
             stats = {}
             
-            # Count by status
             c.execute('SELECT status, COUNT(*) FROM media_queue GROUP BY status')
             for status, count in c.fetchall():
                 stats[f'{status}_count'] = count
             
-            # Total processed
             c.execute('SELECT COUNT(*) FROM processed_media')
             stats['total_processed'] = c.fetchone()[0]
             
-            # Pending by user
-            c.execute('''
-                SELECT user_id, COUNT(*) 
-                FROM media_queue 
-                WHERE status="pending" 
-                GROUP BY user_id
-            ''')
-            stats['pending_by_user'] = dict(c.fetchall())
+            c.execute('SELECT user_id, COUNT(*) FROM media_queue WHERE status="pending" GROUP BY user_id')
+            stats['pending_by_user'] = {str(uid): count for uid, count in c.fetchall()}
             
             return stats
-            
         except Exception as e:
             logger.error(f"Error getting queue stats: {e}")
             return {}
         finally:
             if conn:
                 conn.close()
+    
+    # Access Control DB operations
+    async def is_user_allowed(self, user_id: int) -> bool:
+        """Check if user is allowed to use the bot (delegates to centralized is_authorized)."""
+        return await is_authorized(user_id)
+    
+    async def add_allowed_user(self, user_id: int, username: str, added_by: int) -> bool:
+        """Add or reactivate user in allowed list."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO allowed_users 
+                (user_id, username, added_by, added_time, is_active)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, 1)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    added_by = excluded.added_by,
+                    added_time = CURRENT_TIMESTAMP,
+                    is_active = 1
+            ''', (user_id, username, added_by))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding allowed user: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    async def remove_allowed_user(self, user_id: int) -> bool:
+        """Remove/deactivate user from allowed list (Admin cannot be deactivated)."""
+        if is_admin_id(user_id):
+            logger.warning(f"Attempted to deactivate admin user_id={user_id} in database - blocked.")
+            return False
+            
+        conn = None
+        try:
+            conn = self._get_connection()
+            c = conn.cursor()
+            c.execute('UPDATE allowed_users SET is_active = 0 WHERE user_id = ?', (user_id,))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error removing allowed user: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    async def get_allowed_users(self) -> List[Dict[str, Any]]:
+        """Get list of all active allowed users from database."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute('''
+                SELECT user_id, username, added_by, added_time 
+                FROM allowed_users 
+                WHERE is_active = 1
+                ORDER BY added_time DESC
+            ''')
+            return [dict(row) for row in c.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting allowed users: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
 
-async def load_config():
-    """Load configuration from settings file"""
-    if os.path.exists(SETTINGS_FILE):
-        async with aiofiles.open(SETTINGS_FILE, mode="r") as file:
-            settings = json.loads(await file.read())
-        
-        api_id = settings.get("api_id")
-        api_hash = settings.get("api_hash")
-        admin_id = settings.get("admin_id")
-        bot_token = settings.get("bot_token", "")
-        session_name = settings.get("session_name", "self_destruct")
-        channel_id = settings.get("channel_id")
-        
-        # Store bot config globally
-        global BOT_CONFIG
-        BOT_CONFIG = {
-            "api_id": api_id,
-            "api_hash": api_hash,
-            "bot_token": bot_token
-        }
-        
-        return api_id, api_hash, admin_id, bot_token, session_name, channel_id
-    
-    return await create_new_config()
+    async def get_all_users_db(self) -> List[Dict[str, Any]]:
+        """Get list of all users from database (both active and inactive)."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute('''
+                SELECT user_id, username, added_by, added_time, is_active 
+                FROM allowed_users 
+                ORDER BY added_time DESC
+            ''')
+            return [dict(row) for row in c.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting all users from database: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
 
 
-async def create_new_config():
-    """Create new configuration file"""
-    console.print("[yellow]No configuration found. Let's create one.[/yellow]")
+# =====================================================================
+# CONFIGURATION & STATE MANAGEMENT
+# =====================================================================
+
+async def load_config() -> Tuple[Optional[int], Optional[str], Optional[int], Optional[str], str, Optional[int]]:
+    """Load configuration strictly from environment variables, with settings.json fallback."""
+    global BOT_CONFIG, CONFIGURED_ADMIN_ID
     
-    console.print("\n[cyan]=== Bot Configuration ===[/cyan]")
-    console.print("This bot will only use Bot Token for login.")
-    console.print("Users can login with their own accounts using /login command.")
+    api_id_raw = os.getenv("API_ID")
+    api_hash = os.getenv("API_HASH")
+    admin_id_raw = os.getenv("ADMIN_ID")
+    bot_token = os.getenv("BOT_TOKEN", "")
+    session_name = os.getenv("SESSION_NAME", "self_destruct")
+    channel_id_raw = os.getenv("CHANNEL_ID")
     
-    api_id = input("Enter your API_ID: ").strip()
-    api_hash = input("Enter your API_HASH: ").strip()
-    bot_token = input("Enter your Bot Token: ").strip()
-    admin_id = input("Enter the Admin ID: ").strip()
-    channel_id = input("Enter the Channel ID where files should be saved (e.g., -1001234567890): ").strip()
-    session_name = input("Enter session name for bot (default: 'self_destruct'): ").strip()
+    # Strip whitespace/quotes
+    if api_hash:
+        api_hash = api_hash.strip().strip('"\'')
+    if bot_token:
+        bot_token = bot_token.strip().strip('"\'')
+    if session_name:
+        session_name = session_name.strip().strip('"\'')
     
-    if not session_name:
-        session_name = "self_destruct"
+    # Parse integers
+    api_id = None
+    if api_id_raw:
+        try:
+            api_id = int(str(api_id_raw).strip().strip('"\''))
+        except (ValueError, TypeError):
+            logger.error("Invalid API_ID in environment: must be an integer.")
+            
+    admin_id = parse_admin_id(admin_id_raw)
     
-    settings = {
-        "api_id": api_id,
-        "api_hash": api_hash,
-        "admin_id": admin_id,
-        "bot_token": bot_token,
-        "session_name": session_name,
-        "channel_id": channel_id
-    }
-    
-    async with aiofiles.open(SETTINGS_FILE, mode="w") as file:
-        await file.write(json.dumps(settings, indent=4))
-    
-    console.print("\n[green]Configuration saved![/green]")
-    
-    # Store bot config globally
-    global BOT_CONFIG
+    channel_id = None
+    if channel_id_raw:
+        try:
+            channel_id = int(str(channel_id_raw).strip().strip('"\''))
+        except (ValueError, TypeError):
+            logger.warning("Invalid CHANNEL_ID in environment.")
+            
+    # Check settings.json fallback if missing
+    if (not api_id or not api_hash or not admin_id or not bot_token) and os.path.exists(SETTINGS_FILE):
+        try:
+            async with aiofiles.open(SETTINGS_FILE, mode="r") as f:
+                settings = json.loads(await f.read())
+            api_id = api_id or (int(settings["api_id"]) if settings.get("api_id") else None)
+            api_hash = api_hash or settings.get("api_hash")
+            admin_id = admin_id or parse_admin_id(settings.get("admin_id"))
+            bot_token = bot_token or settings.get("bot_token", "")
+            session_name = session_name or settings.get("session_name", "self_destruct")
+            if channel_id is None and settings.get("channel_id"):
+                try:
+                    channel_id = int(settings["channel_id"])
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Failed to read settings.json fallback: {e}")
+            
     BOT_CONFIG = {
         "api_id": api_id,
         "api_hash": api_hash,
-        "bot_token": bot_token
+        "bot_token": bot_token,
+        "admin_id": admin_id,
+        "channel_id": channel_id,
+        "session_name": session_name
     }
+    CONFIGURED_ADMIN_ID = admin_id
     
     return api_id, api_hash, admin_id, bot_token, session_name, channel_id
 
 
-async def update_channel_id(new_channel_id):
-    """Update global channel ID in settings file"""
-    if os.path.exists(SETTINGS_FILE):
-        async with aiofiles.open(SETTINGS_FILE, mode="r") as file:
-            settings = json.loads(await file.read())
-        
-        settings["channel_id"] = new_channel_id
-        
+async def update_channel_id(new_channel_id: str) -> bool:
+    """Update global channel ID in settings.json."""
+    try:
+        settings = {}
+        if os.path.exists(SETTINGS_FILE):
+            async with aiofiles.open(SETTINGS_FILE, mode="r") as file:
+                settings = json.loads(await file.read())
+        settings["channel_id"] = str(new_channel_id)
         async with aiofiles.open(SETTINGS_FILE, mode="w") as file:
             await file.write(json.dumps(settings, indent=4))
-        
         return True
-    return False
+    except Exception as e:
+        logger.error(f"Error updating channel ID in settings: {e}")
+        return False
 
 
-async def update_user_channel_id(user_id, new_channel_id, state):
-    """Update channel ID for a specific user in state"""
+async def update_user_channel_id(user_id: int, new_channel_id: int, state: dict) -> bool:
+    """Update personal channel ID for a specific user."""
     if str(user_id) in state.get("user_sessions", {}):
         state["user_sessions"][str(user_id)]["channel_id"] = new_channel_id
         await save_state(state)
@@ -470,43 +937,58 @@ async def update_user_channel_id(user_id, new_channel_id, state):
     return False
 
 
-async def get_user_channel_id(user_id, state):
-    """Get channel ID for a specific user"""
+async def get_user_channel_id(user_id: int, state: dict) -> Optional[int]:
+    """Get channel ID for a specific user."""
     user_session = state.get("user_sessions", {}).get(str(user_id))
     if user_session:
         return user_session.get("channel_id")
     return None
 
 
-async def load_state():
-    """Load bot state from file"""
+async def load_state() -> dict:
+    """Load bot state from bot_state.json safely."""
     if os.path.exists(STATE_FILE):
-        async with aiofiles.open(STATE_FILE, mode="r") as file:
-            state = json.loads(await file.read())
+        try:
+            async with aiofiles.open(STATE_FILE, mode="r") as file:
+                state = json.loads(await file.read())
+        except Exception as e:
+            logger.error(f"Error reading state file {STATE_FILE}: {e}")
+            state = {}
     else:
-        state = {"letter_counter": 0, "user_folders": {}, "user_sessions": {}, "login_sessions": {}}
-    
-    # Initialize global forwarding setting if not exists
-    if "global_forwarding_enabled" not in state:
-        state["global_forwarding_enabled"] = True  # Default: enabled
-    
+        state = {}
+        
+    state.setdefault("letter_counter", 0)
+    state.setdefault("user_folders", {})
+    state.setdefault("user_sessions", {})
+    state.setdefault("login_sessions", {})
+    state.setdefault("global_forwarding_enabled", True)
     return state
 
 
-async def save_state(state):
-    """Save bot state to file"""
-    async with aiofiles.open(STATE_FILE, mode="w") as file:
-        await file.write(json.dumps(state, indent=4))
+async def save_state(state: dict):
+    """Save bot state to bot_state.json atomically."""
+    temp_file = f"{STATE_FILE}.tmp"
+    try:
+        async with aiofiles.open(temp_file, mode="w") as file:
+            await file.write(json.dumps(state, indent=4))
+        os.replace(temp_file, STATE_FILE)
+    except Exception as e:
+        logger.error(f"Error saving state: {e}")
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
 
 
-def get_user_session_file(user_id):
-    """Get session file path for a user"""
-    return os.path.join(SESSIONS_DIR, f"user_{user_id}.session")
+def get_user_session_file(user_id: int) -> str:
+    """Get secure session file path for a user."""
+    return os.path.join(SESSIONS_DIR, f"user_{int(user_id)}.session")
 
 
 class RichDownloadProgress:
-    """Enhanced progress bar for downloads"""
-    def __init__(self, filename, total_size):
+    """Enhanced progress bar for terminal download tracking."""
+    def __init__(self, filename: str, total_size: int):
         self.filename = filename
         self.total_size = total_size
         self.progress = Progress(
@@ -521,1072 +1003,655 @@ class RichDownloadProgress:
         self.task = self.progress.add_task(f"[cyan]Downloading {filename}", total=total_size)
         self.progress.start()
     
-    def update(self, downloaded):
+    def update(self, downloaded: int):
         self.progress.update(self.task, completed=downloaded)
     
     def close(self):
         self.progress.stop()
 
-async def is_admin(event, admin_id):
-    """Check if sender is admin"""
-    if admin_id is None:
-        return False
 
-    try:
-        return event.sender_id == int(admin_id)
-    except Exception:
-        return False
-
-async def safe_notify(bot_client, user_id, text):
-    """
-    Safely notify a user.
-    If bot cannot DM user, silently ignore.
-    """
-    try:
-        await bot_client.send_message(
-            user_id,
-            text,
-            silent=True
-        )
-
-    except (UserIsBlockedError, PeerIdInvalidError):
-        # User blocked bot OR never started bot
+async def safe_notify(bot_client: TelegramClient, user_id: int, text: str):
+    """Safely notify a user via bot DM without throwing on blocks or missing peers."""
+    if not bot_client:
         return
-
+    try:
+        await bot_client.send_message(user_id, text, silent=True)
+    except (UserIsBlockedError, PeerIdInvalidError):
+        pass
     except ValueError as e:
-        # Entity not found (VERY COMMON)
         if "Could not find the input entity" in str(e):
-            return
-
+            pass
     except FloodWaitError as e:
-        logger.warning(f"FloodWait {e.seconds}s while notifying {user_id}")
-
+        logger.warning(f"FloodWait {e.seconds}s while notifying user {user_id}")
     except Exception as e:
         logger.debug(f"safe_notify skipped for {user_id}: {e}")
 
 
-async def check_missed_media(user_id, user_client, state):
-    """Check for missed self-destructing media (last 48 hours) when coming back online"""
-    console.print(f"[cyan]Checking missed media for user {user_id} (last 48 hours)...[/cyan]")
+def extract_ttl(message: Any) -> Optional[int]:
+    """Extract self-destructing TTL in seconds from all potential Telethon message metadata."""
+    if not message or not hasattr(message, 'media') or not message.media:
+        return None
     
-    try:
-        dialogs = await user_client.get_dialogs(limit=50)
+    media = message.media
+    # 1. Direct ttl_seconds on media
+    if hasattr(media, 'ttl_seconds') and media.ttl_seconds:
+        return int(media.ttl_seconds)
+    
+    # 2. Photo ttl_seconds
+    if hasattr(media, 'photo') and hasattr(media.photo, 'ttl_seconds') and media.photo.ttl_seconds:
+        return int(media.photo.ttl_seconds)
         
-        total_found = 0
-        total_queued = 0
+    # 3. Document ttl_seconds
+    if hasattr(media, 'document') and hasattr(media.document, 'ttl_seconds') and media.document.ttl_seconds:
+        return int(media.document.ttl_seconds)
         
-        # Calculate time 48 hours ago
-        time_48h_ago = datetime.now() - timedelta(hours=48)
-        console.print(f"[cyan]Checking messages since: {time_48h_ago}[/cyan]")
-        
-        for dialog in dialogs:
-            if dialog.is_user and dialog.entity.bot is False:
-                chat_id = dialog.entity.id
-                last_seen_id = await MEDIA_QUEUE.get_last_seen(user_id, chat_id)
+    # 4. Video / Voice / Audio attributes
+    for attr_name in ['video', 'document', 'voice', 'audio', 'video_note']:
+        sub = getattr(media, attr_name, None)
+        if sub and hasattr(sub, 'ttl_seconds') and sub.ttl_seconds:
+            return int(sub.ttl_seconds)
+            
+    # 5. Document attributes list inspection
+    if hasattr(media, 'document') and hasattr(media.document, 'attributes') and media.document.attributes:
+        for attr in media.document.attributes:
+            if hasattr(attr, 'ttl_seconds') and attr.ttl_seconds:
+                return int(attr.ttl_seconds)
                 
-                console.print(f"[yellow]Checking chat with {dialog.entity.username or dialog.entity.first_name}[/yellow]")
-                
-                try:
-                    # Get messages from last 48 hours
-                    messages = []
-                    async for message in user_client.iter_messages(
-                        dialog.entity, 
-                        limit=200,  # Increased limit to scan more messages
-                        offset_date=time_48h_ago,
-                        reverse=True  # Get newest first
-                    ):
-                        messages.append(message)
-                    
-                    console.print(f"[cyan]Found {len(messages)} messages in last 48 hours[/cyan]")
-                    
-                    for message in messages:
-                        # Skip if message is older than last seen
-                        if message.id <= last_seen_id:
-                            continue
-                            
-                        ttl = None
-                        if hasattr(message, 'media') and message.media:
-                            if hasattr(message.media, 'ttl_seconds'):
-                                ttl = message.media.ttl_seconds
-                            elif hasattr(message.media, 'photo') and hasattr(message.media.photo, 'ttl_seconds'):
-                                ttl = message.media.photo.ttl_seconds
-                            elif hasattr(message.media, 'document') and hasattr(message.media.document, 'ttl_seconds'):
-                                ttl = message.media.document.ttl_seconds
-                            elif hasattr(message.media, 'video') and hasattr(message.media.video, 'ttl_seconds'):
-                                ttl = message.media.video.ttl_seconds
-                        
-                        if ttl and ttl > 0:
-                            total_found += 1
-                            console.print(f"[green]Found self-destructing media (TTL: {ttl}s) from {message.date}[/green]")
-                            
-                            session_string = user_client.session.save()
-                            sender = await message.get_sender()
-                            sender_username = sender.username if sender and hasattr(sender, 'username') else "Unknown"
-                            sender_id = sender.id if sender else None
-                            
-                            # Determine media type
-                            media_type = "unknown"
-                            if message.photo:
-                                media_type = "jpg"
-                            elif message.video:
-                                media_type = "mp4"
-                            elif message.document:
-                                media_type = "bin"
-                            elif message.audio:
-                                media_type = "mp3"
-                            elif message.voice:
-                                media_type = "ogg"
-                            elif message.video_note:
-                                media_type = "mp4"
-                            
-                            queue_id = await MEDIA_QUEUE.add_to_queue(
-                                user_id,
-                                session_string,
-                                user_client.api_id,
-                                user_client.api_hash,
-                                message.id,
-                                chat_id,
-                                media_type,
-                                sender_username,
-                                sender_id,
-                                ttl
-                            )
-                            
-                            if queue_id:
-                                total_queued += 1
-                                console.print(f"[yellow]Queued missed media (ID: {queue_id})[/yellow]")
-                            else:
-                                console.print(f"[red]Failed to queue media (message ID: {message.id})[/red]")
-                    
-                    if messages:
-                        last_msg_id = max([msg.id for msg in messages]) if messages else last_seen_id
-                        await MEDIA_QUEUE.update_last_seen(user_id, chat_id, last_msg_id)
-                        
-                except Exception as e:
-                    console.print(f"[red]Error checking chat {chat_id}: {e}[/red]")
-        
-        console.print(f"[green]Found {total_found} self-destructing media in last 48 hours, queued {total_queued}[/green]")
-        return total_found
-        
-    except Exception as e:
-        console.print(f"[red]Error checking missed media: {e}[/red]")
-        return 0
+    return None
 
-async def process_queued_media():
-    """Process queued media when bot comes online"""
-    console.print("[cyan]Processing queued media...[/cyan]")
-    
-    pending_items = await MEDIA_QUEUE.get_pending_media(limit=10)
-    
-    if not pending_items:
-        console.print("[green]No pending media in queue[/green]")
-        return
-    
-    console.print(f"[yellow]Found {len(pending_items)} pending media items[/yellow]")
-    
-    processed_count = 0
-    failed_count = 0
-    
-    for item in pending_items:
+
+def get_media_type_str(event_or_message: Any) -> Tuple[str, str]:
+    """Determine media extension and media type name from message."""
+    msg = getattr(event_or_message, 'message', event_or_message)
+    if not msg or not hasattr(msg, 'media') or not msg.media:
+        return ".bin", "unknown"
+        
+    if getattr(msg, 'photo', None):
+        return ".jpg", "photo"
+    elif getattr(msg, 'video', None):
+        return ".mp4", "video"
+    elif getattr(msg, 'video_note', None):
+        return ".mp4", "video_note"
+    elif getattr(msg, 'voice', None):
+        return ".ogg", "voice"
+    elif getattr(msg, 'audio', None):
+        return ".mp3", "audio"
+    elif getattr(msg, 'document', None):
+        ext = ".bin"
+        if hasattr(msg.document, 'attributes') and msg.document.attributes:
+            for attr in msg.document.attributes:
+                if hasattr(attr, 'file_name') and attr.file_name:
+                    ext = os.path.splitext(attr.file_name)[1] or ".bin"
+                    break
+        return ext, "document"
+    return ".bin", "unknown"
+
+
+# =====================================================================
+# CHANNEL & FILE DELIVERY HELPERS
+# =====================================================================
+
+async def send_to_user_channel(user_client: TelegramClient, file_path: str, username: str, channel_id: int) -> bool:
+    """Send file to user's personal channel using USER'S client."""
+    try:
+        if not os.path.exists(file_path):
+            logger.error(f"Cannot upload to user channel: File not found {file_path}")
+            return False
+
         try:
-            console.print(f"[cyan]Processing queue item {item['id']} for user {item['user_id']}[/cyan]")
-            
-            # Check retry count
-            if item['retry_count'] >= 3:
-                console.print(f"[red]Item {item['id']} exceeded max retries[/red]")
-                await MEDIA_QUEUE.update_status(item['id'], 'failed')
-                failed_count += 1
-                continue
-            
-            await MEDIA_QUEUE.update_status(item['id'], 'processing', item['retry_count'] + 1)
-            
-            # Load user client
-            session = StringSession(item['session_string'])
-            user_client = TelegramClient(session, item['api_id'], item['api_hash'])
-            
-            await user_client.connect()
-            
-            if await user_client.is_user_authorized():
-                try:
-                    # First, ensure we have the entity in cache by getting dialogs
-                    console.print(f"[cyan]Loading dialogs for user {item['user_id']}...[/cyan]")
-                    
-                    # Get a few dialogs to populate entity cache
-                    try:
-                        dialogs = await user_client.get_dialogs(limit=10)
-                        console.print(f"[cyan]Loaded {len(dialogs)} dialogs[/cyan]")
-                    except Exception as e:
-                        console.print(f"[yellow]Warning: Could not load dialogs: {e}[/yellow]")
-                    
-                    # Try multiple methods to get the entity
-                    entity = None
-                    
-                    # Method 1: Try to get entity by peer
-                    try:
-                        # Check if chat_id is negative (channel/group) or positive (user)
-                        if item['chat_id'] < 0:
-                            # For channels/groups
-                            entity = await user_client.get_entity(item['chat_id'])
-                        else:
-                            # For users, we need to resolve the user
-                            # Try to get from recent dialogs first
-                            for dialog in dialogs:
-                                if dialog.entity.id == item['chat_id']:
-                                    entity = dialog.entity
-                                    break
-                            
-                            # If not found in dialogs, try to get directly
-                            if not entity:
-                                entity = await user_client.get_entity(item['chat_id'])
-                        
-                        console.print(f"[green]Found entity: {entity.id}[/green]")
-                    except Exception as e:
-                        console.print(f"[yellow]Method 1 failed to get entity: {e}[/yellow]")
-                    
-                    # Method 2: Try using input peer if we have sender info
-                    if not entity and item.get('sender_username'):
-                        try:
-                            entity = await user_client.get_entity(item['sender_username'])
-                            console.print(f"[green]Found entity by username: {item['sender_username']}[/green]")
-                        except Exception as e:
-                            console.print(f"[yellow]Method 2 failed to get entity by username: {e}[/yellow]")
-                    
-                    # Method 3: Try using peer ID directly
-                    if not entity:
-                        try:
-                            from telethon.tl.types import InputPeerUser
-                            
-                            # Since we don't have access_hash, try to get it from dialogs
-                            access_hash = None
-                            for dialog in dialogs:
-                                if hasattr(dialog.entity, 'access_hash') and dialog.entity.id == item['chat_id']:
-                                    access_hash = dialog.entity.access_hash
-                                    break
-                            
-                            if access_hash:
-                                entity = InputPeerUser(user_id=item['chat_id'], access_hash=access_hash)
-                                console.print(f"[green]Created InputPeerUser with access_hash[/green]")
-                            else:
-                                # Last resort: try to get the entity without access_hash
-                                entity = item['chat_id']
-                                console.print(f"[yellow]Using chat_id directly as entity[/yellow]")
-                        except Exception as e:
-                            console.print(f"[yellow]Method 3 failed: {e}[/yellow]")
-                    
-                    if not entity:
-                        console.print(f"[red]Could not resolve entity for chat_id {item['chat_id']}[/red]")
-                        await MEDIA_QUEUE.update_status(item['id'], 'pending')
-                        failed_count += 1
-                        await user_client.disconnect()
-                        continue
-                    
-                    # Now try to get the message
-                    try:
-                        message = await user_client.get_messages(entity, ids=item['message_id'])
-                        
-                        if message and message.media:
-                            console.print(f"[green]Found queued message {item['message_id']}[/green]")
-                            
-                            # Check TTL first
-                            ttl = None
-                            if hasattr(message, 'media') and message.media:
-                                if hasattr(message.media, 'ttl_seconds'):
-                                    ttl = message.media.ttl_seconds
-                                elif hasattr(message.media, 'photo') and hasattr(message.media.photo, 'ttl_seconds'):
-                                    ttl = message.media.photo.ttl_seconds
-                                elif hasattr(message.media, 'document') and hasattr(message.media.document, 'ttl_seconds'):
-                                    ttl = message.media.document.ttl_seconds
-                            
-                            # Check if media is still available (not expired)
-                            if ttl and ttl <= 0:
-                                console.print(f"[yellow]Media expired (TTL: {ttl}), skipping[/yellow]")
-                                await MEDIA_QUEUE.mark_as_processed(
-                                    item['id'],
-                                    item['user_id'],
-                                    item['message_id'],
-                                    item['chat_id'],
-                                    item['media_type'],
-                                    item['sender_username'],
-                                    False,
-                                    None
-                                )
-                                await MEDIA_QUEUE.update_status(item['id'], 'expired')
-                                failed_count += 1
-                                continue
-                            
-                            # Download media
-                            timestamp = int(time.time())
-                            random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-                            filename = f"{timestamp}_{random_str}.{item['media_type']}"
-                            file_path = os.path.join(all_media_dir, f"temp_{filename}")
-                            
-                            file_size = message.file.size if message.file else 0
-                            progress = RichDownloadProgress(filename, file_size) if file_size > 0 else None
-                            
-                            # Download with retry
-                            max_retries = 2
-                            for retry in range(max_retries):
-                                try:
-                                    await message.download_media(
-                                        file=file_path,
-                                        progress_callback=lambda c, t: progress.update(c) if progress else None
-                                    )
-                                    break
-                                except Exception as download_error:
-                                    if retry == max_retries - 1:
-                                        raise download_error
-                                    console.print(f"[yellow]Download failed, retry {retry + 1}/{max_retries}[/yellow]")
-                                    await asyncio.sleep(1)
-                            
-                            if progress:
-                                progress.close()
-                            
-                            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                                state = await load_state()
-                                
-                                # Process the downloaded file
-                                success = await user_downloader_queue(
-                                    user_client,
-                                    file_path,
-                                    item['sender_username'] or "Unknown",
-                                    item['user_id'],
-                                    state,
-                                    item['media_type'],
-                                    ttl or item.get('ttl_seconds')
-                                )
-                                
-                                if success:
-                                    await MEDIA_QUEUE.mark_as_processed(
-                                        item['id'],
-                                        item['user_id'],
-                                        item['message_id'],
-                                        item['chat_id'],
-                                        item['media_type'],
-                                        item['sender_username'],
-                                        True,
-                                        file_path
-                                    )
-                                    
-                                    await MEDIA_QUEUE.update_last_seen(item['user_id'], item['chat_id'], item['message_id'])
-                                    processed_count += 1
-                                    console.print(f"[green]✓ Processed queued media {item['id']}[/green]")
-                                else:
-                                    await MEDIA_QUEUE.update_status(item['id'], 'pending')
-                                    failed_count += 1
-                                    
-                                    # Clean up failed file
-                                    try:
-                                        if os.path.exists(file_path):
-                                            os.remove(file_path)
-                                    except:
-                                        pass
-                            else:
-                                console.print(f"[red]Downloaded file is empty or doesn't exist[/red]")
-                                await MEDIA_QUEUE.update_status(item['id'], 'pending')
-                                failed_count += 1
-                        else:
-                            console.print(f"[yellow]Message not found or has no media: {item['message_id']}[/yellow]")
-                            await MEDIA_QUEUE.update_status(item['id'], 'failed')
-                            failed_count += 1
-                            
-                    except Exception as e:
-                        console.print(f"[red]Error downloading message: {e}[/red]")
-                        await MEDIA_QUEUE.update_status(item['id'], 'pending')
-                        failed_count += 1
-                        
-                except Exception as e:
-                    console.print(f"[red]Error processing message: {e}[/red]")
-                    await MEDIA_QUEUE.update_status(item['id'], 'pending')
-                    failed_count += 1
-            else:
-                console.print(f"[red]User {item['user_id']} not authorized[/red]")
-                await MEDIA_QUEUE.update_status(item['id'], 'failed')
-                failed_count += 1
-            
-            await user_client.disconnect()
-            await asyncio.sleep(2)  # Increased delay between processing
-            
+            channel_id = int(channel_id)
+        except Exception:
+            logger.error(f"Invalid channel_id: {channel_id}")
+            return False
+
+        if channel_id >= 0:
+            console.print(f"[red]ERROR: Channel ID {channel_id} is a positive user ID, not a channel ID![/red]")
+            return False
+
+        file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        filename = os.path.basename(file_path)
+
+        caption = (
+            f"📥 Downloaded from: @{username}\n"
+            f"📁 File: {filename}\n"
+            f"📊 Size: {file_size_mb:.2f} MB\n"
+            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        console.print(f"[yellow]Sending to user channel {channel_id} using USER client[/yellow]")
+
+        try:
+            await user_client.send_file(channel_id, file=file_path, caption=caption)
+            console.print(f"[green]✓ File sent to user channel {channel_id}[/green]")
+            return True
         except Exception as e:
-            console.print(f"[red]Error processing queued media: {e}[/red]")
-            await MEDIA_QUEUE.update_status(item['id'], 'failed' if item['retry_count'] >= 2 else 'pending')
-            failed_count += 1
-    
-    console.print(f"[green]Processed {processed_count} items, failed {failed_count}[/green]")
+            logger.warning(f"Direct send to channel {channel_id} failed: {e}. Resolving entity...")
+            entity = await user_client.get_entity(channel_id)
+            await user_client.send_file(entity, file=file_path, caption=caption)
+            console.print(f"[green]✓ File sent via entity to user channel {channel_id}[/green]")
+            return True
 
-
-async def user_downloader_queue(user_client, file_path, sender_username, user_id, state, media_type, ttl):
-    """Process downloaded media from queue"""
-    try:
-        # Get user's channel from state
-        user_session = state.get("user_sessions", {}).get(str(user_id))
-        user_channel_id = user_session.get("channel_id") if user_session else None
-        
-        # Send to user's channel if set
-        if user_channel_id:
-            try:
-                success = await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
-                if success:
-                    console.print(f"[green]✓ Media sent to user's channel {user_channel_id}[/green]")
-            except Exception as e:
-                console.print(f"[red]Error sending to user channel: {e}[/red]")
-        
-        # Also send to admin channel if available
-        global BOT_CLIENT
-        if BOT_CLIENT and hasattr(BOT_CLIENT, 'channel_id') and BOT_CLIENT.channel_id:
-            try:
-                success = await send_to_admin_channel(BOT_CLIENT, file_path, sender_username, BOT_CLIENT.channel_id)
-                if success:
-                    console.print(f"[green]✓ Media sent to admin's channel {BOT_CLIENT.channel_id}[/green]")
-            except Exception as e:
-                console.print(f"[red]Error sending to admin channel: {e}[/red]")
-        
-        # Organize file
-        final_path = await organize_and_save_file(file_path, sender_username, user_id, state, media_type)
-        
-        console.print(f"[green]✓ Successfully processed queued media (TTL: {ttl}s)[/green]")
-        return True
-        
     except Exception as e:
-        console.print(f"[red]Error processing media file from queue: {e}[/red]")
+        console.print(f"[red]send_to_user_channel failed: {e}[/red]")
+        logger.error(f"send_to_user_channel error for channel {channel_id}: {e}")
         return False
 
 
-async def organize_and_save_file(file_path, sender_username, user_id, state, media_type):
-    """Organize and save file to proper folder"""
+async def send_to_admin_channel(bot_client: TelegramClient, file_path: str, username: str, channel_id: int) -> bool:
+    """Send file to admin's channel using BOT client."""
     try:
-        user_folder_key = f"{sender_username}_{user_id}"
+        if not os.path.exists(file_path):
+            logger.error(f"Cannot upload to admin channel: File not found {file_path}")
+            return False
+
+        try:
+            channel_id = int(channel_id)
+        except Exception:
+            logger.error(f"Invalid admin channel_id: {channel_id}")
+            return False
+
+        file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        filename = os.path.basename(file_path)
+
+        caption = (
+            f"📥 Downloaded from: @{username}\n"
+            f"📁 File: {filename}\n"
+            f"📊 Size: {file_size_mb:.2f} MB\n"
+            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        console.print(f"[yellow]Sending to admin channel {channel_id} using BOT client[/yellow]")
+
+        try:
+            await bot_client.send_file(channel_id, file=file_path, caption=caption)
+            console.print(f"[green]✓ File sent to admin channel {channel_id}[/green]")
+            return True
+        except Exception as e:
+            logger.warning(f"Direct send to admin channel {channel_id} failed: {e}. Resolving entity...")
+            entity = await bot_client.get_entity(channel_id)
+            await bot_client.send_file(entity, file=file_path, caption=caption)
+            console.print(f"[green]✓ File sent via entity to admin channel {channel_id}[/green]")
+            return True
+
+    except Exception as e:
+        console.print(f"[red]send_to_admin_channel failed: {e}[/red]")
+        logger.error(f"send_to_admin_channel error for channel {channel_id}: {e}")
+        return False
+
+
+async def organize_and_save_file(file_path: str, sender_username: str, user_id: int, state: dict, media_type: str) -> str:
+    """Organize and move temporary file into sanitized user subfolder."""
+    try:
+        clean_sender = sanitize_folder_name(sender_username)
+        user_folder_key = f"{clean_sender}_{user_id}"
         
         if user_folder_key in state["user_folders"]:
             user_folder_name = state["user_folders"][user_folder_key]
         else:
             counter = state["letter_counter"]
             letter = string.ascii_uppercase[counter % 26]
-            user_folder_name = f"{counter:02d} - {letter} - @{sender_username} - {user_id}"
+            user_folder_name = f"{counter:02d} - {letter} - @{clean_sender} - {user_id}"
             state["user_folders"][user_folder_key] = user_folder_name
             state["letter_counter"] += 1
             await save_state(state)
         
-        user_folder_path = os.path.join(all_media_dir, user_folder_name)
+        user_folder_path = os.path.join(MEDIA_DIR, user_folder_name)
         os.makedirs(user_folder_path, exist_ok=True)
         
         timestamp = int(time.time())
         random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-        final_filename = f"{timestamp}_{random_str}.{media_type}"
+        
+        # Clean extension
+        ext = media_type if media_type.startswith('.') else f".{media_type}"
+        clean_ext = sanitize_filename(ext)
+        final_filename = f"{timestamp}_{random_str}{clean_ext}"
         final_path = os.path.join(user_folder_path, final_filename)
         
-        os.rename(file_path, final_path)
-        
+        # Safe move
+        shutil.move(file_path, final_path)
         console.print(f"[green]✓ File organized: {final_path}[/green]")
         return final_path
         
     except Exception as e:
-        console.print(f"[red]Error organizing file: {e}[/red]")
+        logger.error(f"Error organizing file: {e}")
         return file_path
-# ===== END NEW FUNCTIONS =====
 
 
-async def handle_start(event, admin_id):
-    """Handle /start command"""
-    if event.is_private:
-        welcome_message = (
-            "🤖 **Welcome to Self-Destructing Media Downloader Bot!**\n\n"
-            "This bot can download media files and save them to a channel.\n\n"
-            "**Features:**\n"
-            "• Download photos, videos, documents\n"
-            "• Send files to your personal channel\n"
-            "• Progress tracking\n"
-            "• Offline media recovery (NEW!)\n"
-            "• Queue system for missed media\n\n"
-            "**For Users:**\n"
-            "1. Use /login to login with your own account\n"
-            "2. Use /setchannel to set your personal channel\n"
-            "3. Use /checkmissed to find missed media (last 48h)\n"
-            "4. Your self-destructing media will be saved to your channel\n\n"
-            "**For Admin:**\n"
-            "Use /help to see all available commands.\n\n"
-            "Enjoy using the bot!"
-        )
-        await event.reply(welcome_message, parse_mode='markdown')
+# =====================================================================
+# MEDIA DOWNLOADER & QUEUE PROCESSOR
+# =====================================================================
 
-
-async def handle_login(event, admin_id, bot_client, state):
-    """Handle /login command for user session login"""
-    if not event.is_private:
-        await event.reply("❌ Please use this command in private chat.")
-        return
-    
-    user_id = event.sender_id
-    user_session_file = get_user_session_file(user_id)
-    
-    # Check if user already has a session
-    if os.path.exists(user_session_file) and str(user_id) in state.get("user_sessions", {}):
-        await event.reply(
-            "✅ You are already logged in!\n"
-            "You can now receive and save self-destructing media from your account.\n\n"
-            "Set your personal channel: /setchannel\n"
-            "Check your status: /mystatus\n"
-            "Check missed media (last 48h): /checkmissed\n\n"
-            "To logout, use /logout command."
-        )
-        return
-    
-    # Start login process - Step 1
-    message = (
-        "**1. Send Your API ID.**\n\n"
-        "Click On /skip To Skip This Process\n\n"
-        "**NOTE :- If You Skip This Then Your Account Ban Chance Is High.**\n\n"
-        "To get API ID and API HASH, visit: https://my.telegram.org"
-    )
-    
-    # Initialize login session
-    if "login_sessions" not in state:
-        state["login_sessions"] = {}
-    
-    state["login_sessions"][str(user_id)] = {
-        "step": "api_id",
-        "api_id": None,
-        "api_hash": None,
-        "phone": None,
-        "phone_code_hash": None,
-        "temp_client": None
-    }
-    
-    await save_state(state)
-    await event.reply(message, parse_mode='markdown')
-
-
-async def handle_skip(event, admin_id, state):
-    """Handle /skip command during login - Use bot's API credentials with WARNING"""
-    if not event.is_private:
-        await event.reply("❌ Please use this command in private chat.")
-        return
-    
-    user_id = event.sender_id
-    user_data = state.get("login_sessions", {}).get(str(user_id))
-    
-    if not user_data:
-        await event.reply("❌ No login session found. Please start with /login command.")
-        return
-    
-    if user_data.get("step") != "api_id":
-        await event.reply("❌ Cannot skip at this step.")
-        return
-    
-    # Skip API ID - use bot's API credentials (MUST DISPLAY WARNING)
-    global BOT_CONFIG
-    if BOT_CONFIG is None:
-        # Load config if not loaded
-        await load_config()
-    
-    if BOT_CONFIG is None:
-        await event.reply("❌ Bot configuration not loaded. Please restart the bot.")
-        return
-    
-    # Send strong warning message
-    warning_message = (
-        "⚠️⚠️⚠️ **CRITICAL WARNING** ⚠️⚠️⚠️\n\n"
-        "You are about to use the bot's API credentials!\n\n"
-        "🚨 **THIS IS HIGHLY RISKY AND NOT RECOMMENDED!** 🚨\n\n"
-        "**Why this is dangerous:**\n"
-        "• Your account may be flagged by Telegram\n"
-        "• The bot account could be banned\n"
-        "• Your API credentials could be exposed\n"
-        "• Multiple accounts using same API is against ToS\n\n"
-        "**Recommended alternative:**\n"
-        "1. Create your own API credentials at https://my.telegram.org\n"
-        "2. Use them for your account\n"
-        "3. This is safer and more reliable\n\n"
-        "**Do you want to continue?**\n"
-        "Type `YES, I UNDERSTAND THE RISKS` to proceed with bot's API\n"
-        "Type `/cancel` to cancel and use your own API\n"
-    )
-    
-    state["login_sessions"][str(user_id)]["step"] = "skip_confirmation"
-    await save_state(state)
-    
-    await event.reply(warning_message, parse_mode='markdown')
-
-async def handle_skip_confirmation(event, admin_id, state):
-    """Handle skip confirmation"""
-    if not event.is_private:
-        return
-    
-    user_id = event.sender_id
-    user_data = state.get("login_sessions", {}).get(str(user_id))
-    
-    if not user_data or user_data.get("step") != "skip_confirmation":
-        return
-    
-    text = event.text.strip()
-    
-    if text.lower() == "/cancel":
-        await handle_cancel(event, admin_id, state)
-        return
-    
-    # User must type exact confirmation
-    if text != "YES, I UNDERSTAND THE RISKS":
-        await event.reply(
-            "❌ You must type exactly: `YES, I UNDERSTAND THE RISKS`\n"
-            "If you don't want to proceed, use `/cancel`",
-            parse_mode='markdown'
-        )
-        return
-    
-    # Use bot's API credentials
-    global BOT_CONFIG
-    
-    state["login_sessions"][str(user_id)]["api_id"] = BOT_CONFIG["api_id"]
-    state["login_sessions"][str(user_id)]["api_hash"] = BOT_CONFIG["api_hash"]
-    state["login_sessions"][str(user_id)]["step"] = "phone"
-    await save_state(state)
-    
-    await event.reply(
-        "⚠️ **Using bot's API credentials - Proceed at your own risk!**\n\n"
-        "**3. Please send your phone number which includes country code**\n"
-        "Example: +13124562345, +9171828181889\n\n"
-        "Enter /cancel to cancel the process"
-    )
-
-async def handle_api_id(event, admin_id, state):
-    """Handle API ID input"""
-    if not event.is_private:
-        return
-    
-    user_id = event.sender_id
-    user_data = state.get("login_sessions", {}).get(str(user_id))
-    
-    if not user_data or user_data.get("step") != "api_id":
-        return
-    
-    text = event.text.strip()
-    
-    # Check if user wants to cancel
-    if text.lower() == "/cancel":
-        await handle_cancel(event, admin_id, state)
-        return
-    
-    # Check if user wants to skip
-    if text.lower() == "/skip":
-        await handle_skip(event, admin_id, state)
-        return
-    
-    # Try to parse as integer
+async def user_downloader(event: Any, user_client: TelegramClient, bot_client: TelegramClient,
+                          media_base_dir: str, state: dict):
+    """Download self-destructing media from user account and distribute to channels."""
+    temp_path = None
     try:
-        api_id = int(text)
-        
-        # Validate API ID (should be a positive integer)
-        if api_id <= 0:
-            await event.reply("❌ API ID must be a positive number.\nExample: `1234567`\nEnter /cancel to cancel", parse_mode='markdown')
-            return
-        
-        # Store in state
-        state["login_sessions"][str(user_id)]["api_id"] = api_id
-        state["login_sessions"][str(user_id)]["step"] = "api_hash"
-        await save_state(state)
-        
-        await event.reply(
-            "✅ **API ID saved!**\n\n"
-            "**2. Now Send Me Your API HASH**\n\n"
-            "Enter /cancel to cancel the process\n"
-            "Example: `a1b2c3d4e5f67890abcdef1234567890`"
-        )
-        
-    except ValueError:
-        await event.reply("❌ Invalid API_ID. Please send a valid number.\nExample: `1234567`\nEnter /cancel to cancel", parse_mode='markdown')
-
-
-async def handle_api_hash(event, admin_id, state):
-    """Handle API Hash input"""
-    if not event.is_private:
-        return
-    
-    user_id = event.sender_id
-    user_data = state.get("login_sessions", {}).get(str(user_id))
-    
-    if not user_data or user_data.get("step") != "api_hash":
-        await event.reply("❌ Please complete previous steps first.")
-        return
-    
-    text = event.text.strip()
-    
-    # Check if user wants to cancel
-    if text.lower() == "/cancel":
-        await handle_cancel(event, admin_id, state)
-        return
-    
-    # The text is the API hash
-    api_hash = text
-    
-    # Update state
-    state["login_sessions"][str(user_id)]["api_hash"] = api_hash
-    state["login_sessions"][str(user_id)]["step"] = "phone"
-    await save_state(state)
-    
-    await event.reply(
-        "**3. Please send your phone number which includes country code**\n"
-        "Example: +13124562345, +9171828181889\n\n"
-        "Enter /cancel to cancel the process"
-    )
-
-
-async def handle_phone(event, admin_id, state, bot_client):
-    """Handle phone number input"""
-    if not event.is_private:
-        return
-    
-    user_id = event.sender_id
-    user_data = state.get("login_sessions", {}).get(str(user_id))
-    
-    if not user_data or user_data.get("step") != "phone":
-        await event.reply("❌ Please complete previous steps first.")
-        return
-    
-    text = event.text.strip()
-    
-    # Check if user wants to cancel
-    if text.lower() == "/cancel":
-        await handle_cancel(event, admin_id, state)
-        return
-    
-    phone = text
-    
-    # Validate phone format
-    if not phone.startswith('+'):
-        await event.reply("❌ Phone number must start with country code (e.g., +1, +91)\nExample: `+1234567890`", parse_mode='markdown')
-        return
-    
-    try:
-        api_id = user_data["api_id"]
-        api_hash = user_data["api_hash"]
-        
-        # Create a unique session for this user
-        session = StringSession()
-        user_client = TelegramClient(session, api_id, api_hash)
-        
-        # Store in state
-        state["login_sessions"][str(user_id)]["phone"] = phone
-        state["login_sessions"][str(user_id)]["step"] = "code"
-        await save_state(state)
-        
-        # Send code request
-        await user_client.connect()
-        sent_code = await user_client.send_code_request(phone)
-        
-        # Save session string to state (this is serializable)
-        session_string = user_client.session.save()
-        state["login_sessions"][str(user_id)]["session_string"] = session_string
-        state["login_sessions"][str(user_id)]["phone_code_hash"] = sent_code.phone_code_hash
-        await save_state(state)
-        
-        # Disconnect the client for now
-        await user_client.disconnect()
-        
-        await event.reply(
-            "**4. Sending OTP...**\n\n"
-            "**5. Please check for an OTP in official telegram account. If you got it, send OTP here after reading the below format.**\n\n"
-            "If OTP is 12345, please send it as `1 2 3 4 5`.\n\n"
-            "Enter /cancel to cancel The Process"
-        )
-        
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "phone" in error_msg and "invalid" in error_msg:
-            await event.reply("❌ Invalid phone number. Please check and try again.\nExample: `+1234567890`", parse_mode='markdown')
-        elif "flood" in error_msg:
-            await event.reply("❌ Too many attempts. Please wait before trying again.")
-        else:
-            await event.reply(f"❌ Error: {str(e)}")
-        
-        # Clean up
-        if str(user_id) in state["login_sessions"]:
-            del state["login_sessions"][str(user_id)]
-        await save_state(state)
-
-
-async def handle_code(event, admin_id, state):
-    """Handle verification code input"""
-    if not event.is_private:
-        return
-    
-    user_id = event.sender_id
-    user_data = state.get("login_sessions", {}).get(str(user_id))
-    
-    if not user_data or user_data.get("step") != "code":
-        await event.reply("❌ Please complete previous steps first.")
-        return
-    
-    # Check if user wants to cancel
-    if event.text.lower() == "/cancel":
-        await handle_cancel(event, admin_id, state)
-        return
-    
-    # Extract code (remove spaces if user sent with spaces)
-    code = event.text.strip().replace(' ', '')
-    
-    if not code.isdigit():
-        await event.reply("❌ Invalid OTP format. Please send only numbers.\nExample: `1 2 3 4 5` or `12345`", parse_mode='markdown')
-        return
-    
-    if len(code) < 4 or len(code) > 6:
-        await event.reply("❌ OTP should be 4-6 digits. Please check and try again.")
-        return
-    
-    try:
-        phone = user_data["phone"]
-        phone_code_hash = user_data["phone_code_hash"]
-        session_string = user_data.get("session_string")
-        
-        if not session_string:
-            await event.reply("❌ Session data missing. Please restart login with /login")
-            return
-        
-        # Recreate client from session string
-        session = StringSession(session_string)
-        user_client = TelegramClient(
-            session,
-            user_data["api_id"],
-            user_data["api_hash"]
-        )
-        
-        await user_client.connect()
-        
-        # Try to sign in
         try:
-            await user_client.sign_in(
-                phone=phone,
-                code=code,
-                phone_code_hash=phone_code_hash
-            )
-            
-            # Login successful
-            await complete_user_login(event, user_id, user_client, state)
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            # Check if 2FA is required
-            if "two-steps" in error_msg or "2fa" in error_msg or "password" in error_msg:
-                # Save updated session string
-                new_session_string = user_client.session.save()
-                state["login_sessions"][str(user_id)]["session_string"] = new_session_string
-                state["login_sessions"][str(user_id)]["step"] = "2fa"
-                await save_state(state)
-                
-                await event.reply(
-                    "**6. Your account has enabled two-step verification. Please provide the password.**\n\n"
-                    "Enter /cancel to cancel The Process"
-                )
-                await user_client.disconnect()
-            else:
-                # Invalid code
-                if "code" in error_msg and "invalid" in error_msg:
-                    await event.reply("❌ Invalid OTP. Please check and try again.\nIf OTP is 12345, send as `1 2 3 4 5`", parse_mode='markdown')
-                elif "code" in error_msg and "expired" in error_msg:
-                    await event.reply("❌ OTP expired. Please restart login process with /login")
-                    # Clean up
-                    if str(user_id) in state["login_sessions"]:
-                        del state["login_sessions"][str(user_id)]
-                    await save_state(state)
-                else:
-                    await event.reply(f"❌ Error: {str(e)}")
-                
-                await user_client.disconnect()
+            receiver_entity = await user_client.get_me()
+            receiver_id = receiver_entity.id
+            receiver_username = receiver_entity.username or "NoUsername"
+        except Exception:
+            receiver_id = "Unknown"
+            receiver_username = "Unknown"
         
-    except Exception as e:
-        await event.reply(f"❌ Error: {str(e)}")
-        if 'user_client' in locals():
+        try:
+            sender = await event.get_sender()
+            sender_username = sender.username if sender and getattr(sender, 'username', None) else "NoUsername"
+            sender_id = sender.id if sender and getattr(sender, 'id', None) else "Unknown"
+        except Exception:
+            sender_username = "Unknown"
+            sender_id = "Unknown"
+
+        console.print(f"[cyan]Downloading TTL media from @{sender_username} (Sender ID: {sender_id}) for @{receiver_username} (ID: {receiver_id})[/cyan]")
+
+        file_ext, media_type_name = get_media_type_str(event)
+        
+        # Generate safe temporary file
+        timestamp = int(time.time())
+        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        temp_filename = f"temp_{timestamp}_{random_str}{file_ext}"
+        temp_path = os.path.join(MEDIA_DIR, temp_filename)
+
+        file_size = event.file.size if getattr(event, 'file', None) else 0
+        progress = RichDownloadProgress(temp_filename, file_size) if file_size > 0 else None
+
+        # Download with retry
+        for attempt in range(3):
             try:
-                await user_client.disconnect()
-            except:
+                await event.download_media(
+                    file=temp_path,
+                    progress_callback=lambda c, t: progress.update(c) if progress else None
+                )
+                break
+            except FloodWaitError as fwe:
+                logger.warning(f"FloodWait during download: {fwe.seconds}s. Waiting...")
+                await asyncio.sleep(fwe.seconds + 1)
+            except Exception as dl_err:
+                if attempt == 2:
+                    raise dl_err
+                await asyncio.sleep(1)
+
+        if progress:
+            progress.close()
+
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            console.print("[red]ERROR: Downloaded file is missing or empty.[/red]")
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+            return
+
+        # Organize into structured user folder
+        final_path = await organize_and_save_file(temp_path, sender_username, receiver_id, state, file_ext)
+
+        # Dispatch to channels
+        global_forwarding_enabled = state.get("global_forwarding_enabled", True)
+        user_session = state.get("user_sessions", {}).get(str(receiver_id))
+        user_channel_id = user_session.get("channel_id") if user_session else None
+        admin_channel_id = getattr(bot_client, "channel_id", None)
+
+        sent_to_user_channel = False
+        sent_to_admin_channel = False
+
+        if user_channel_id:
+            try:
+                if await send_to_user_channel(user_client, final_path, sender_username, user_channel_id):
+                    sent_to_user_channel = True
+            except Exception as e:
+                logger.error(f"User channel upload failed: {e}")
+
+        if admin_channel_id and global_forwarding_enabled:
+            if admin_channel_id != user_channel_id:
+                try:
+                    if await send_to_admin_channel(bot_client, final_path, sender_username, admin_channel_id):
+                        sent_to_admin_channel = True
+                except Exception as e:
+                    logger.error(f"Admin channel upload failed: {e}")
+            else:
+                sent_to_admin_channel = True
+
+        logger.info(f"Media saved successfully for user {receiver_id} → {os.path.basename(final_path)}")
+
+    except Exception as e:
+        console.print(f"[red]Error in user_downloader: {e}[/red]")
+        logger.error(f"user_downloader error: {e}")
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
                 pass
 
 
-async def handle_2fa(event, admin_id, state):
-    """Handle 2FA password input"""
-    if not event.is_private:
-        return
+async def user_downloader_queue(user_client: TelegramClient, file_path: str, sender_username: str,
+                                user_id: int, state: dict, media_type: str, ttl: Optional[int]) -> bool:
+    """Process downloaded media from queue and distribute to channels."""
+    try:
+        global_forwarding_enabled = state.get("global_forwarding_enabled", True)
+        user_session = state.get("user_sessions", {}).get(str(user_id))
+        user_channel_id = user_session.get("channel_id") if user_session else None
+
+        if user_channel_id:
+            try:
+                await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
+            except Exception as e:
+                logger.error(f"User channel upload failed in queue: {e}")
+
+        global BOT_CLIENT
+        if BOT_CLIENT and getattr(BOT_CLIENT, 'channel_id', None) and global_forwarding_enabled:
+            admin_channel = BOT_CLIENT.channel_id
+            if admin_channel != user_channel_id:
+                try:
+                    await send_to_admin_channel(BOT_CLIENT, file_path, sender_username, admin_channel)
+                except Exception as e:
+                    logger.error(f"Admin channel upload failed in queue: {e}")
+
+        # Organize into final folder
+        await organize_and_save_file(file_path, sender_username, user_id, state, media_type)
+        return True
+    except Exception as e:
+        logger.error(f"Error in user_downloader_queue: {e}")
+        return False
+
+
+async def process_queue_items(user_id: Optional[int] = None, limit: int = 10, state: Optional[dict] = None) -> Tuple[int, int]:
+    """Unified queue processor handling both per-user and global queue processing."""
+    if not MEDIA_QUEUE:
+        return 0, 0
     
-    user_id = event.sender_id
-    user_data = state.get("login_sessions", {}).get(str(user_id))
+    if state is None:
+        state = await load_state()
+        
+    if user_id is not None:
+        pending_items = await MEDIA_QUEUE.get_pending_media_for_user(user_id, limit=limit)
+    else:
+        pending_items = await MEDIA_QUEUE.get_pending_media(limit=limit)
+        
+    if not pending_items:
+        return 0, 0
+        
+    max_retries = int(os.getenv("MAX_RETRIES", "3"))
+    processed_count = 0
+    failed_count = 0
     
-    if not user_data or user_data.get("step") != "2fa":
-        await event.reply("❌ Please complete previous steps first.")
-        return
-    
-    # Check if user wants to cancel
-    if event.text.lower() == "/cancel":
-        await handle_cancel(event, admin_id, state)
-        return
-    
-    password = event.text.strip()
-    
-    if not password:
-        await event.reply("❌ Please provide your 2FA password.\nEnter /cancel to cancel", parse_mode='markdown')
-        return
+    for item in pending_items:
+        item_id = item['id']
+        curr_retry = item.get('retry_count', 0)
+        
+        if curr_retry >= max_retries:
+            logger.warning(f"Queue item {item_id} exceeded max retries ({max_retries}). Marking failed.")
+            await MEDIA_QUEUE.update_status(item_id, 'failed')
+            failed_count += 1
+            continue
+            
+        await MEDIA_QUEUE.update_status(item_id, 'processing', curr_retry + 1)
+        
+        user_client = None
+        temp_file_path = None
+        try:
+            session_str = item.get('session_string')
+            if not session_str:
+                logger.error(f"Queue item {item_id} missing session string.")
+                await MEDIA_QUEUE.update_status(item_id, 'failed')
+                failed_count += 1
+                continue
+                
+            session = StringSession(session_str)
+            user_client = TelegramClient(session, item['api_id'], item['api_hash'])
+            await user_client.connect()
+            
+            if not await user_client.is_user_authorized():
+                logger.error(f"User {item['user_id']} is no longer authorized. Failing queue item {item_id}.")
+                await MEDIA_QUEUE.update_status(item_id, 'failed')
+                failed_count += 1
+                await user_client.disconnect()
+                continue
+                
+            # Resolve chat entity
+            entity = None
+            try:
+                entity = await user_client.get_entity(item['chat_id'])
+            except Exception:
+                # Try from dialogs cache
+                try:
+                    dialogs = await user_client.get_dialogs(limit=20)
+                    for d in dialogs:
+                        if d.entity.id == item['chat_id']:
+                            entity = d.entity
+                            break
+                except Exception:
+                    pass
+                    
+            if not entity:
+                logger.error(f"Could not resolve entity for chat {item['chat_id']}.")
+                await MEDIA_QUEUE.update_status(item_id, 'pending')
+                failed_count += 1
+                await user_client.disconnect()
+                continue
+                
+            message = await user_client.get_messages(entity, ids=item['message_id'])
+            if not message or not message.media:
+                logger.warning(f"Message {item['message_id']} in chat {item['chat_id']} not found or has no media.")
+                await MEDIA_QUEUE.update_status(item_id, 'failed')
+                failed_count += 1
+                await user_client.disconnect()
+                continue
+                
+            ttl = extract_ttl(message) or item.get('ttl_seconds')
+            
+            # Temporary download
+            timestamp = int(time.time())
+            random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+            file_ext = item.get('media_type', 'bin')
+            if not file_ext.startswith('.'):
+                file_ext = f".{file_ext}"
+            temp_filename = f"temp_q_{timestamp}_{random_str}{file_ext}"
+            temp_file_path = os.path.join(MEDIA_DIR, temp_filename)
+            
+            # Download media
+            await message.download_media(file=temp_file_path)
+            
+            if os.path.exists(temp_file_path) and os.path.getsize(temp_file_path) > 0:
+                success = await user_downloader_queue(
+                    user_client=user_client,
+                    file_path=temp_file_path,
+                    sender_username=item.get('sender_username') or "Unknown",
+                    user_id=item['user_id'],
+                    state=state,
+                    media_type=file_ext,
+                    ttl=ttl
+                )
+                
+                if success:
+                    await MEDIA_QUEUE.mark_as_processed(
+                        queue_id=item_id,
+                        user_id=item['user_id'],
+                        message_id=item['message_id'],
+                        chat_id=item['chat_id'],
+                        media_type=file_ext,
+                        sender_username=item.get('sender_username'),
+                        channel_sent=True,
+                        file_path=temp_file_path
+                    )
+                    await MEDIA_QUEUE.update_last_seen(item['user_id'], item['chat_id'], item['message_id'])
+                    processed_count += 1
+                else:
+                    await MEDIA_QUEUE.update_status(item_id, 'pending')
+                    failed_count += 1
+            else:
+                logger.error(f"Downloaded queue file {temp_file_path} is empty or missing.")
+                await MEDIA_QUEUE.update_status(item_id, 'pending')
+                failed_count += 1
+                
+            await user_client.disconnect()
+            await asyncio.sleep(1)
+            
+        except FloodWaitError as fwe:
+            logger.warning(f"FloodWait in queue processing: {fwe.seconds}s.")
+            await MEDIA_QUEUE.update_status(item_id, 'pending')
+            failed_count += 1
+            if user_client:
+                try:
+                    await user_client.disconnect()
+                except Exception:
+                    pass
+            await asyncio.sleep(fwe.seconds + 1)
+        except Exception as e:
+            logger.error(f"Error processing queue item {item_id}: {e}")
+            await MEDIA_QUEUE.update_status(item_id, 'failed' if curr_retry + 1 >= max_retries else 'pending')
+            failed_count += 1
+            if user_client:
+                try:
+                    await user_client.disconnect()
+                except Exception:
+                    pass
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
+                    
+    return processed_count, failed_count
+
+
+async def process_queued_media():
+    """Process pending queue items across all users."""
+    logger.info("Running process_queued_media()...")
+    processed, failed = await process_queue_items(user_id=None, limit=10)
+    logger.info(f"process_queued_media() completed: {processed} processed, {failed} failed.")
+
+
+async def process_user_queued_media(user_id: int, state: dict):
+    """Process pending queue items for a specific user."""
+    logger.info(f"Running process_user_queued_media() for user {user_id}...")
+    processed, failed = await process_queue_items(user_id=user_id, limit=10, state=state)
+    logger.info(f"User {user_id} queue processing completed: {processed} processed, {failed} failed.")
+
+
+# =====================================================================
+# MISSED MEDIA SCANNER
+# =====================================================================
+
+async def check_missed_media(user_id: int, user_client: TelegramClient, state: dict) -> int:
+    """Scan private chats for missed self-destructing media in the last 48 hours."""
+    logger.info(f"Scanning missed media for user {user_id} (last 48 hours)...")
+    total_found = 0
+    total_queued = 0
     
     try:
-        session_string = user_data.get("session_string")
+        dialogs = await user_client.get_dialogs(limit=50)
+        cutoff_time = datetime.now() - timedelta(hours=48)
         
-        if not session_string:
-            await event.reply("❌ Session data missing. Please restart login with /login")
-            return
-        
-        # Recreate client from session string
-        session = StringSession(session_string)
-        user_client = TelegramClient(
-            session,
-            user_data["api_id"],
-            user_data["api_hash"]
-        )
-        
-        await user_client.connect()
-        
-        # Complete sign in with 2FA
-        await user_client.sign_in(password=password)
-        
-        # Login successful
-        await complete_user_login(event, user_id, user_client, state)
-        
+        for dialog in dialogs:
+            if dialog.is_user and getattr(dialog.entity, 'bot', False) is False:
+                chat_id = dialog.entity.id
+                last_seen_id = await MEDIA_QUEUE.get_last_seen(user_id, chat_id)
+                
+                try:
+                    messages = []
+                    async for message in user_client.iter_messages(
+                        dialog.entity,
+                        limit=200,
+                        offset_date=cutoff_time,
+                        reverse=True
+                    ):
+                        messages.append(message)
+                        
+                    for message in messages:
+                        if message.id <= last_seen_id:
+                            continue
+                            
+                        ttl = extract_ttl(message)
+                        if ttl and ttl > 0:
+                            total_found += 1
+                            session_string = user_client.session.save()
+                            
+                            sender = None
+                            try:
+                                sender = await message.get_sender()
+                            except Exception:
+                                pass
+                                
+                            sender_username = sender.username if sender and getattr(sender, 'username', None) else "Unknown"
+                            sender_id = sender.id if sender and getattr(sender, 'id', None) else None
+                            
+                            file_ext, _ = get_media_type_str(message)
+                            
+                            queue_id = await MEDIA_QUEUE.add_to_queue(
+                                user_id=user_id,
+                                session_string=session_string,
+                                api_id=user_client.api_id,
+                                api_hash=user_client.api_hash,
+                                message_id=message.id,
+                                chat_id=chat_id,
+                                media_type=file_ext,
+                                sender_username=sender_username,
+                                sender_id=sender_id,
+                                ttl_seconds=ttl
+                            )
+                            if queue_id:
+                                total_queued += 1
+                                
+                    if messages:
+                        max_id = max(m.id for m in messages)
+                        if max_id > last_seen_id:
+                            await MEDIA_QUEUE.update_last_seen(user_id, chat_id, max_id)
+                            
+                except Exception as chat_err:
+                    logger.warning(f"Error checking chat {chat_id} for user {user_id}: {chat_err}")
+                    
+        logger.info(f"Missed media scan for user {user_id}: Found {total_found}, Queued {total_queued}")
+        return total_found
     except Exception as e:
-        error_msg = str(e).lower()
-        if "password" in error_msg and "invalid" in error_msg:
-            await event.reply("❌ Invalid 2FA password. Please try again.")
-        else:
-            await event.reply(f"❌ Error: {str(e)}")
-        
-        if 'user_client' in locals():
-            try:
-                await user_client.disconnect()
-            except:
-                pass
+        logger.error(f"check_missed_media error for user {user_id}: {e}")
+        return 0
 
 
-async def setup_user_client_handlers(user_client, user_id, bot_client, state):
-    """Setup event handlers for user client to catch self-destructing media"""
-    
-    console.print(f"[yellow]Setting up handlers for user {user_id}[/yellow]")
+# =====================================================================
+# EVENT HANDLERS & USER/ADMIN COMMANDS
+# =====================================================================
+
+async def setup_user_client_handlers(user_client: TelegramClient, user_id: int, bot_client: TelegramClient, state: dict):
+    """Setup event handlers for user client to catch incoming self-destructing media."""
     
     @user_client.on(events.NewMessage(incoming=True))
     async def user_media_handler(event):
         try:
-            # 🚫 Ignore outgoing messages
-            if event.out:
+            if event.out or not event.is_private or not event.media:
                 return
-
-            # 🚫 Ignore non-private chats
-            if not event.is_private:
-                return
-
-            # 🚫 Ignore messages without media
-            if not event.media:
-                return
-
-            msg = event.message
-
-            # ✅ Check for TTL (self-destructing media)
-            ttl = None
-            if hasattr(msg, 'media') and msg.media:
-                if hasattr(msg.media, 'ttl_seconds'):
-                    ttl = msg.media.ttl_seconds
-                elif hasattr(msg.media, 'photo') and hasattr(msg.media.photo, 'ttl_seconds'):
-                    ttl = msg.media.photo.ttl_seconds
-                elif hasattr(msg.media, 'document') and hasattr(msg.media.document, 'ttl_seconds'):
-                    ttl = msg.media.document.ttl_seconds
-                elif hasattr(msg.media, 'video') and hasattr(msg.media.video, 'ttl_seconds'):
-                    ttl = msg.media.video.ttl_seconds
-                elif hasattr(msg.media, 'video_note') and hasattr(msg.media.video_note, 'ttl_seconds'):
-                    ttl = msg.media.video_note.ttl_seconds
-                elif hasattr(msg.media, 'voice') and hasattr(msg.media.voice, 'ttl_seconds'):
-                    ttl = msg.media.voice.ttl_seconds
-                elif hasattr(msg.media, 'audio') and hasattr(msg.media.audio, 'ttl_seconds'):
-                    ttl = msg.media.audio.ttl_seconds
-
-            # ❌ Ignore normal media (no TTL) - SILENTLY
-            if not ttl:
-                return  # ✅ No console print, just return
-
-            # ✅ Only log self-destructing media
+                
+            ttl = extract_ttl(event.message)
+            if not ttl or ttl <= 0:
+                return  # Silently ignore normal non-TTL media
+                
             console.print(f"[green]⚠️ Self-destructing media detected for user {user_id} (TTL: {ttl}s)[/green]")
             
-            # Get sender info for queue
-            try:
-                sender = await event.get_sender()
-                sender_username = sender.username if sender.username else "Unknown"
-                sender_id = sender.id if sender.id else None
-            except:
-                sender_username = "Unknown"
-                sender_id = None
+            # Download immediately
+            await user_downloader(event, user_client, bot_client, MEDIA_DIR, state)
             
-            # Determine media type
-            if event.photo:
-                media_type = "jpg"
-            elif event.video:
-                media_type = "mp4"
-            elif event.document:
-                media_type = "bin"
-            elif event.audio:
-                media_type = "mp3"
-            elif event.voice:
-                media_type = "ogg"
-            elif event.video_note:
-                media_type = "mp4"
-            else:
-                media_type = "unknown"
-            
-            # ✅ Download immediately
-            await user_downloader(
-                event,
-                user_client,
-                bot_client,
-                all_media_dir,
-                state
-            )
-
-            console.print(f"[magenta]✅ Media saved for user {user_id}[/magenta]")
-            
-            # Update last seen - FIXED: Added await
+            # Update last seen
             await MEDIA_QUEUE.update_last_seen(user_id, event.chat_id, event.id)
             
-            # ✅ Log the successful save
-            logger.info(f"User {user_id} saved self-destructing media (TTL: {ttl}s)")
-            
-            # Also add to queue as backup - FIXED: Added await
-            session_string = user_client.session.save()
-            await MEDIA_QUEUE.add_to_queue(
-                user_id,
-                session_string,
-                user_client.api_id,
-                user_client.api_hash,
-                event.id,
-                event.chat_id,
-                media_type,
-                sender_username,
-                sender_id,
-                ttl
-            )
-
         except Exception as e:
-            # Only log actual errors
-            console.print(f"[red]❌ Error in user media handler for {user_id}: {e}[/red]")
             logger.error(f"User media handler error for {user_id}: {e}")
 
 
-async def complete_user_login(event, user_id, user_client, state):
-    """Complete user login process"""
+async def complete_user_login(event: Any, user_id: int, user_client: TelegramClient, state: dict):
+    """Complete user authentication, persist session, setup handlers, and run missed media check."""
     try:
-        # Get user info
         me = await user_client.get_me()
-        
-        # Save session to file
         session_string = user_client.session.save()
         user_session_file = get_user_session_file(user_id)
         
+        # Save session file with 0600 permissions
         async with aiofiles.open(user_session_file, mode="w") as f:
             await f.write(session_string)
-        
-        # Update state
-        if "user_sessions" not in state:
-            state["user_sessions"] = {}
-        
+        try:
+            os.chmod(user_session_file, 0o600)
+        except OSError:
+            pass
+            
+        state.setdefault("user_sessions", {})
         state["user_sessions"][str(user_id)] = {
             "api_id": user_client.api_id,
             "api_hash": user_client.api_hash,
@@ -1596,3525 +1661,1510 @@ async def complete_user_login(event, user_id, user_client, state):
             "last_name": me.last_name,
             "session_file": user_session_file,
             "login_time": time.time(),
-            "channel_id": None  # Initialize with no channel
+            "channel_id": state.get("user_sessions", {}).get(str(user_id), {}).get("channel_id")
         }
         
-        # Clean up login session
-        if "login_sessions" in state and str(user_id) in state["login_sessions"]:
+        if str(user_id) in state.get("login_sessions", {}):
             del state["login_sessions"][str(user_id)]
-        
+            
         await save_state(state)
         
-        # Get bot client
-        global BOT_CLIENT
+        global BOT_CLIENT, ACTIVE_USER_CLIENTS
         if BOT_CLIENT:
-            # Setup handlers for user client
             await setup_user_client_handlers(user_client, user_id, BOT_CLIENT, state)
-        
-        # Store user client in global dictionary
-        global ACTIVE_USER_CLIENTS
+            
         ACTIVE_USER_CLIENTS[str(user_id)] = user_client
+        await cast(Any, user_client.start())
         
-        # Start the user client in background
-        await user_client.start()
-        
-        # Check for missed media from last 48 hours
+        # Run background check for missed media
         missed_count = await check_missed_media(user_id, user_client, state)
         
-        # Send welcome message
         welcome_msg = (
             f"✅ **Login Successful!**\n\n"
             f"👤 **Account Details:**\n"
-            f"• Name: {me.first_name} {me.last_name if me.last_name else ''}\n"
-            f"• Username: @{me.username if me.username else 'Not set'}\n"
-            f"• Phone: {me.phone}\n"
-            f"• User ID: {me.id}\n\n"
+            f"• Name: {me.first_name} {me.last_name or ''}\n"
+            f"• Username: @{me.username or 'Not set'}\n"
+            f"• User ID: `{me.id}`\n\n"
         )
-        
         if missed_count > 0:
-            welcome_msg += f"📥 **Found {missed_count} missed self-destructing media from last 48 hours!**\n"
-            welcome_msg += "They have been queued for processing.\n\n"
-        
+            welcome_msg += f"📥 **Found {missed_count} missed self-destructing media from the last 48 hours!** (Queued)\n\n"
+            
         welcome_msg += (
-            f"📱 **Now you can:**\n"
-            f"• Set your personal channel: /setchannel\n"
-            f"• Self-destructing media will be automatically saved to your channel\n"
-            f"• Check for missed media: /checkmissed\n"
-            f"• Use /mystatus to check your session\n"
-            f"• Use /logout to logout\n\n"
-            f"✅ **Offline media recovery is ENABLED!**\n"
-            f"Your media will be saved even if the server was offline."
+            f"📱 **Next Steps:**\n"
+            f"• Set personal channel: `/setmychannel -100xxxxxxxxxx`\n"
+            f"• Test channel access: `/mychanneltest`\n"
+            f"• Check session status: `/mystatus`\n"
+            f"• Check missed media: `/checkmissed`\n"
+            f"• Logout anytime: `/logout`\n\n"
+            f"🛡️ **Offline Media Recovery:** ACTIVE"
         )
         
         await event.reply(welcome_msg, parse_mode='markdown')
-        
-        console.print(f"[green]✓ User {user_id} (@{me.username}) logged in successfully[/green]")
+        logger.info(f"User {user_id} (@{me.username}) successfully logged in.")
         
     except Exception as e:
-        await event.reply(f"❌ Error completing login: {str(e)}")
-        console.print(f"[red]Error completing login for user {user_id}: {e}[/red]")
-        
-        # Clean up on error
+        logger.error(f"Error completing login for user {user_id}: {e}")
+        await event.reply(f"❌ Error completing login: {e}")
         if str(user_id) in state.get("login_sessions", {}):
-            try:
-                await user_client.disconnect()
-            except:
-                pass
             del state["login_sessions"][str(user_id)]
             await save_state(state)
 
-async def send_to_user_channel(user_client, file_path, username, channel_id):
-    """Send file to user's personal channel using USER'S client"""
-    try:
-        if not os.path.exists(file_path):
-            logger.error("File does not exist")
-            return False
 
-        # Normalize channel_id
-        try:
-            channel_id = int(channel_id)
-        except Exception:
-            logger.error(f"Invalid channel_id: {channel_id}")
-            return False
+# --- USER COMMANDS ---
 
-        # ✅ NEW: Check if channel_id is negative (should be for channels)
-        if channel_id >= 0:
-            console.print(f"[red]ERROR: Channel ID is positive ({channel_id}). This is likely a USER ID, not a CHANNEL ID![/red]")
-            return False
-
-        file_size = os.path.getsize(file_path)
-        file_size_mb = file_size / (1024 * 1024)
-        filename = os.path.basename(file_path)
-
-        caption = (
-            f"📥 Downloaded from: @{username}\n"
-            f"📁 File: {filename}\n"
-            f"📊 Size: {file_size_mb:.2f} MB\n"
-            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-
-        console.print(f"[yellow]Sending to user's channel {channel_id} using USER client[/yellow]")
-
-        # Try to send file using user's client
-        try:
-            await user_client.send_file(
-                channel_id,
-                file=file_path,
-                caption=caption
-            )
-            console.print(f"[green]✓ File sent to user's channel {channel_id} using USER client[/green]")
-            return True
-        except Exception as e:
-            console.print(f"[red]Failed to send to user's channel: {e}[/red]")
-            
-            # Check if it's a common error
-            error_str = str(e).lower()
-            
-            # If it's a "PeerUser" error, it means channel_id is actually a user ID
-            if "peeruser" in error_str or "user_id" in error_str:
-                console.print(f"[red]CRITICAL: Channel ID {channel_id} is actually a USER ID, not a channel![/red]")
-                console.print(f"[red]User needs to set a proper channel ID starting with -100[/red]")
-                return False
-            
-            # Try alternative method
-            try:
-                entity = await user_client.get_entity(channel_id)
-                await user_client.send_file(
-                    entity,
-                    file=file_path,
-                    caption=caption
-                )
-                console.print(f"[green]✓ File sent via entity using USER client[/green]")
-                return True
-            except Exception as e2:
-                console.print(f"[red]Entity send failed using USER client: {e2}[/red]")
-                return False
-
-    except Exception as e:
-        console.print(f"[red]send_to_user_channel fatal error: {e}[/red]")
-        return False
-
-async def send_to_admin_channel(bot_client, file_path, username, channel_id):
-    """Send file to admin's channel using BOT client"""
-    try:
-        if not os.path.exists(file_path):
-            logger.error("File does not exist")
-            return False
-
-        # Normalize channel_id
-        try:
-            channel_id = int(channel_id)
-        except Exception:
-            logger.error(f"Invalid channel_id: {channel_id}")
-            return False
-
-        file_size = os.path.getsize(file_path)
-        file_size_mb = file_size / (1024 * 1024)
-        filename = os.path.basename(file_path)
-
-        caption = (
-            f"📥 Downloaded from: @{username}\n"
-            f"📁 File: {filename}\n"
-            f"📊 Size: {file_size_mb:.2f} MB\n"
-            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-
-        console.print(f"[yellow]Sending to admin's channel {channel_id} using BOT client[/yellow]")
-
-        # Try to send file using bot's client
-        try:
-            await bot_client.send_file(
-                channel_id,
-                file=file_path,
-                caption=caption
-            )
-            console.print(f"[green]✓ File sent to admin's channel {channel_id} using BOT client[/green]")
-            return True
-        except Exception as e:
-            console.print(f"[red]Failed to send to admin's channel: {e}[/red]")
-            
-            # Try alternative method
-            try:
-                entity = await bot_client.get_entity(channel_id)
-                await bot_client.send_file(
-                    entity,
-                    file=file_path,
-                    caption=caption
-                )
-                console.print(f"[green]✓ File sent via entity using BOT client[/green]")
-                return True
-            except Exception as e2:
-                console.print(f"[red]Entity send failed using BOT client: {e2}[/red]")
-                return False
-
-    except Exception as e:
-        console.print(f"[red]send_to_admin_channel fatal error: {e}[/red]")
-        return False
-        
-async def user_downloader(event, user_client, bot_client, all_media_dir, state):
-    """Download media from user's account and send to BOTH channels"""
-    try:
-        # ✅ FIX: Pehle receiver (logged-in user) ka ID nikalo
-        try:
-            receiver_entity = await user_client.get_me()
-            receiver_id = receiver_entity.id
-            receiver_username = receiver_entity.username if receiver_entity.username else "NoUsername"
-        except:
-            receiver_id = "Unknown"
-            receiver_username = "Unknown"
-        
-        console.print(f"[cyan]Receiver (logged-in user): {receiver_username} (ID: {receiver_id})[/cyan]")
-        
-        # ✅ Ab sender (jo media bhej raha hai) ka info nikalo
-        try:
-            sender = await event.get_sender()
-            sender_username = sender.username if sender.username else "NoUsername"
-            sender_id = sender.id if sender.id else "Unknown"
-        except:
-            sender_username = "Unknown"
-            sender_id = "Unknown"
-
-        console.print(f"[cyan]Downloading from @{sender_username} (Sender ID: {sender_id}) to @{receiver_username} (Receiver ID: {receiver_id})[/cyan]")
-
-        # Find existing folder or create new one
-        # ✅ SENDER ke info se folder banaye (organization ke liye)
-        user_folder_key = f"{sender_username}_{sender_id}"
-
-        if user_folder_key in state["user_folders"]:
-            user_folder_name = state["user_folders"][user_folder_key]
-        else:
-            counter = state["letter_counter"]
-            letter = string.ascii_uppercase[counter % 26]
-            user_folder_name = f"{counter:02d} - {letter} - @{sender_username} - {sender_id}"
-            state["user_folders"][user_folder_key] = user_folder_name
-            state["letter_counter"] += 1
-            await save_state(state)
-
-        user_folder_path = os.path.join(all_media_dir, user_folder_name)
-        os.makedirs(user_folder_path, exist_ok=True)
-
-        # Generate unique filename
-        timestamp = int(time.time())
-        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-
-        # Determine file type and extension
-        if event.photo:
-            file_ext = ".jpg"
-            media_type = "photo"
-        elif event.video:
-            file_ext = ".mp4"
-            media_type = "video"
-        elif event.document:
-            if hasattr(event.document, 'attributes') and event.document.attributes:
-                for attr in event.document.attributes:
-                    if hasattr(attr, 'file_name') and attr.file_name:
-                        file_ext = os.path.splitext(attr.file_name)[1]
-                        break
-                else:
-                    file_ext = ".bin"
-            else:
-                file_ext = ".bin"
-            media_type = "document"
-        elif event.audio:
-            file_ext = ".mp3"
-            media_type = "audio"
-        elif event.voice:
-            file_ext = ".ogg"
-            media_type = "voice"
-        elif event.video_note:
-            file_ext = ".mp4"
-            media_type = "video_note"
-        else:
-            file_ext = ".bin"
-            media_type = "unknown"
-
-        filename = f"{timestamp}_{random_str}{file_ext}"
-        file_path = os.path.join(user_folder_path, filename)
-
-        # Download with progress
-        file_size = event.file.size if event.file else 0
-        console.print(f"[cyan]File size: {file_size} bytes[/cyan]")
-
-        progress = RichDownloadProgress(filename, file_size) if file_size > 0 else None
-
-        await event.download_media(
-            file=file_path,
-            progress_callback=lambda c, t: progress.update(c) if progress else None
-        )
-
-        if progress:
-            progress.close()
-
-        # Verify save
-        if not os.path.exists(file_path):
-            console.print("[red]ERROR: File was not saved[/red]")
-            return
-
-        actual_size = os.path.getsize(file_path)
-        file_size_mb = actual_size / (1024 * 1024) if actual_size > 0 else 0
-
-        console.print(
-            f"[green]✓ Downloaded {media_type} ({file_size_mb:.2f} MB) from @{sender_username} → {filename}[/green]"
-        )
-        logger.info(
-            f"Downloaded {media_type} ({file_size_mb:.2f} MB) from @{sender_username} to @{receiver_username} → {filename}"
-        )
-
-        # ✅ IMPORTANT FIX: Ab RECEIVER ka ID use karo user session dhoondne ke liye
-        # Send to BOTH channels if configured
-        # 1. First check if RECEIVER (logged-in user) has personal channel
-        user_session = state.get("user_sessions", {}).get(str(receiver_id))  # ✅ CHANGE HERE
-        
-        user_channel_id = None
-        if user_session:
-            # Use RECEIVER's personal channel if set
-            user_channel_id = user_session.get("channel_id")
-            console.print(f"[cyan]RECEIVER's personal channel ID: {user_channel_id}[/cyan]")
-        else:
-            console.print(f"[yellow]No user session found for receiver ID: {receiver_id}[/yellow]")
-            # Debug: Print all user sessions
-            console.print(f"[yellow]Available user sessions: {list(state.get('user_sessions', {}).keys())}[/yellow]")
-        
-        # 2. Get admin's global channel
-        admin_channel_id = getattr(bot_client, "channel_id", None)
-        console.print(f"[cyan]Admin global channel ID: {admin_channel_id}[/cyan]")
-        
-        # Track sending status
-        sent_to_user_channel = False
-        sent_to_admin_channel = False
-        
-        # Send to RECEIVER's personal channel FIRST (using RECEIVER'S client)
-        if user_channel_id:
-            try:
-                success = await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
-                if success:
-                    console.print(f"[green]✓ File sent to RECEIVER's personal channel {user_channel_id}[/green]")
-                    sent_to_user_channel = True
-                else:
-                    console.print(f"[red]Failed to send to RECEIVER's personal channel {user_channel_id}[/red]")
-                    logger.warning(f"File saved but failed to send to RECEIVER's channel: {filename}")
-            except Exception as e:
-                console.print(f"[red]RECEIVER channel upload error: {e}[/red]")
-                logger.error(f"RECEIVER channel upload error: {e}")
-        
-        # Send to admin's global channel SECOND (using BOT client)
-        if admin_channel_id:
-            # Check if admin channel is different from RECEIVER's channel
-            if admin_channel_id != user_channel_id:
-                try:
-                    success = await send_to_admin_channel(bot_client, file_path, sender_username, admin_channel_id)
-                    if success:
-                        console.print(f"[green]✓ File sent to admin's global channel {admin_channel_id}[/green]")
-                        sent_to_admin_channel = True
-                    else:
-                        console.print(f"[red]Failed to send to admin's global channel {admin_channel_id}[/red]")
-                        logger.warning(f"File saved but failed to send to admin channel: {filename}")
-                except Exception as e:
-                    console.print(f"[red]Admin channel upload error: {e}[/red]")
-                    logger.error(f"Admin channel upload error: {e}")
-            else:
-                console.print("[yellow]Admin channel and RECEIVER channel are same, skipping duplicate send[/yellow]")
-                sent_to_admin_channel = True  # Already sent via RECEIVER channel
-        
-        # Send summary
-        if sent_to_user_channel or sent_to_admin_channel:
-            channels_sent = []
-            if sent_to_user_channel:
-                channels_sent.append("RECEIVER's personal channel")
-                        
-            console.print(f"[green]✓ File sent to: {', '.join(channels_sent)}[/green]")
-            
-            # ✅ Also notify the receiver about the save
-            try:
-                global BOT_CLIENT
-                if BOT_CLIENT:
-                    channel_names = []
-                    if sent_to_user_channel:
-                        channel_names.append("your personal channel")
-                    
-            except Exception as e:
-                console.print(f"[yellow]Could not notify user: {e}[/yellow]")
-        else:
-            console.print("[yellow]No channel configured, file saved locally only[/yellow]")
-
-    except Exception as e:
-        console.print(f"[red]Error in user_downloader: {e}[/red]")
-        logger.error(f"User downloader error: {e}")
-
-async def handle_cancel(event, admin_id, state):
-    """Handle /cancel command during login"""
+async def handle_start(event: Any, admin_id: Optional[int]):
+    """Handle /start command."""
     if not event.is_private:
         return
-    
-    user_id = event.sender_id
-    
-    # Check if user is in login process
-    if str(user_id) not in state.get("login_sessions", {}):
-        await event.reply("❌ No active login session to cancel.")
-        return
-    
-    # Remove login session
-    del state["login_sessions"][str(user_id)]
-    await save_state(state)
-    
-    await event.reply("❌ Login process cancelled.")
+    welcome_message = (
+        "🤖 **Welcome to Self-Destructing Media Downloader Bot!**\n\n"
+        "This bot captures self-destructing (TTL) media using authorized user sessions.\n\n"
+        "**Features:**\n"
+        "• Instant capture of self-destructing photos, videos, voice, audio, and documents\n"
+        "• Automatic delivery to your personal Telegram channel\n"
+        "• Dual-channel backup with optional global forwarding\n"
+        "• 48-hour offline recovery queue system\n\n"
+        "**Getting Started:**\n"
+        "1. Login: `/login`\n"
+        "2. Set personal channel: `/setmychannel <channel_id>`\n"
+        "3. Test channel: `/mychanneltest`\n"
+        "4. Recover missed media: `/checkmissed`\n"
+        "5. See all commands: `/help`"
+    )
+    await event.reply(welcome_message, parse_mode='markdown')
 
 
-async def handle_logout(event, admin_id, state):
-    """Handle /logout command"""
+async def handle_login(event: Any, admin_id: Optional[int], bot_client: TelegramClient, state: dict):
+    """Handle /login command."""
     if not event.is_private:
         await event.reply("❌ Please use this command in private chat.")
         return
-    
+        
     user_id = event.sender_id
-    
-    # Check if user has a session
-    if str(user_id) not in state.get("user_sessions", {}):
-        await event.reply("❌ You are not logged in.")
+    if not await is_authorized(user_id, admin_id):
+        admin_contact = "the administrator"
+        try:
+            target_admin = parse_admin_id(admin_id) or CONFIGURED_ADMIN_ID
+            if target_admin and bot_client:
+                admin_ent = await bot_client.get_entity(target_admin)
+                admin_contact = f"@{admin_ent.username}" if getattr(admin_ent, 'username', None) else "the administrator"
+        except Exception:
+            pass
+        await event.reply(
+            "❌ **Access Denied**\n\n"
+            "You are not authorized to use this bot.\n"
+            f"Please contact {admin_contact} for access."
+        )
         return
-    
-    # Remove session file
+        
     user_session_file = get_user_session_file(user_id)
     if os.path.exists(user_session_file):
-        os.remove(user_session_file)
+        try:
+            async with aiofiles.open(user_session_file, mode="r") as f:
+                session_string = await f.read()
+            if session_string:
+                session = StringSession(session_string)
+                user_client = TelegramClient(
+                    session,
+                    BOT_CONFIG["api_id"] if BOT_CONFIG else int(os.getenv("API_ID", "0")),
+                    BOT_CONFIG["api_hash"] if BOT_CONFIG else os.getenv("API_HASH", "")
+                )
+                await user_client.connect()
+                if await user_client.is_user_authorized():
+                    await setup_user_client_handlers(user_client, user_id, bot_client, state)
+                    ACTIVE_USER_CLIENTS[str(user_id)] = user_client
+                    await cast(Any, user_client.start())
+                    await event.reply(
+                        "✅ **You are already logged in!**\n\n"
+                        "• Set channel: `/setmychannel <id>`\n"
+                        "• Check status: `/mystatus`\n"
+                        "• Recover media: `/checkmissed`\n"
+                        "• Logout: `/logout`"
+                    )
+                    return
+                else:
+                    await user_client.disconnect()
+                    os.remove(user_session_file)
+        except Exception as e:
+            logger.warning(f"Session verification failed for {user_id}: {e}")
+            try:
+                if os.path.exists(user_session_file):
+                    os.remove(user_session_file)
+            except OSError:
+                pass
+                
+    state.setdefault("login_sessions", {})
+    state["login_sessions"][str(user_id)] = {
+        "step": "api_id",
+        "api_id": None,
+        "api_hash": None,
+        "phone": None,
+        "phone_code_hash": None,
+        "session_string": None
+    }
+    await save_state(state)
     
-    # Remove from state
-    if "user_sessions" in state and str(user_id) in state["user_sessions"]:
+    await event.reply(
+        "**1. Send Your Telegram API ID:**\n\n"
+        "Obtain credentials from https://my.telegram.org\n"
+        "Enter `/cancel` anytime to abort.",
+        parse_mode='markdown'
+    )
+
+
+async def handle_api_id(event: Any, admin_id: Optional[int], state: dict):
+    """Handle API ID input in login flow."""
+    user_id = event.sender_id
+    user_data = state.get("login_sessions", {}).get(str(user_id))
+    if not user_data or user_data.get("step") != "api_id":
+        return
+        
+    text = event.text.strip()
+    if text.lower() == "/cancel":
+        await handle_cancel(event, admin_id, state)
+        return
+        
+    try:
+        api_id = int(text)
+        if api_id <= 0:
+            raise ValueError()
+        state["login_sessions"][str(user_id)]["api_id"] = api_id
+        state["login_sessions"][str(user_id)]["step"] = "api_hash"
+        await save_state(state)
+        await event.reply(
+            "✅ **API ID saved!**\n\n"
+            "**2. Now send your Telegram API HASH:**\n"
+            "Enter `/cancel` to abort.",
+            parse_mode='markdown'
+        )
+    except ValueError:
+        await event.reply("❌ Invalid API ID. Must be a positive number.\nExample: `1234567`\nEnter `/cancel` to abort.")
+
+
+async def handle_api_hash(event: Any, admin_id: Optional[int], state: dict):
+    """Handle API Hash input in login flow."""
+    user_id = event.sender_id
+    user_data = state.get("login_sessions", {}).get(str(user_id))
+    if not user_data or user_data.get("step") != "api_hash":
+        return
+        
+    text = event.text.strip()
+    if text.lower() == "/cancel":
+        await handle_cancel(event, admin_id, state)
+        return
+        
+    state["login_sessions"][str(user_id)]["api_hash"] = text
+    state["login_sessions"][str(user_id)]["step"] = "phone"
+    await save_state(state)
+    await event.reply(
+        "**3. Please send your phone number with country code:**\n"
+        "Example: `+13124562345` or `+919876543210`\n\n"
+        "Enter `/cancel` to abort.",
+        parse_mode='markdown'
+    )
+
+
+async def handle_phone(event: Any, admin_id: Optional[int], state: dict, bot_client: TelegramClient):
+    """Handle phone number input and request verification code."""
+    user_id = event.sender_id
+    user_data = state.get("login_sessions", {}).get(str(user_id))
+    if not user_data or user_data.get("step") != "phone":
+        return
+        
+    text = event.text.strip()
+    if text.lower() == "/cancel":
+        await handle_cancel(event, admin_id, state)
+        return
+        
+    phone = text
+    if not phone.startswith('+'):
+        await event.reply("❌ Phone number must start with country code (e.g., `+1`, `+91`).\nEnter `/cancel` to abort.")
+        return
+        
+    user_client = None
+    try:
+        api_id = user_data["api_id"]
+        api_hash = user_data["api_hash"]
+        
+        session = StringSession()
+        user_client = TelegramClient(session, api_id, api_hash)
+        await user_client.connect()
+        
+        sent_code = await user_client.send_code_request(phone)
+        
+        state["login_sessions"][str(user_id)]["phone"] = phone
+        state["login_sessions"][str(user_id)]["step"] = "code"
+        state["login_sessions"][str(user_id)]["session_string"] = user_client.session.save()
+        state["login_sessions"][str(user_id)]["phone_code_hash"] = sent_code.phone_code_hash
+        await save_state(state)
+        
+        await user_client.disconnect()
+        await event.reply(
+            "**4. OTP Verification Code Sent!**\n\n"
+            "Please check your official Telegram account for the login code.\n"
+            "Format: Send code with spaces, e.g. `1 2 3 4 5` or `12345`.\n\n"
+            "Enter `/cancel` to abort.",
+            parse_mode='markdown'
+        )
+    except FloodWaitError as fwe:
+        await event.reply(f"❌ Telegram rate limit: Too many attempts. Please wait {fwe.seconds} seconds.")
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+    except Exception as e:
+        await event.reply(f"❌ Error sending code: {e}")
+        if str(user_id) in state.get("login_sessions", {}):
+            del state["login_sessions"][str(user_id)]
+            await save_state(state)
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+
+
+async def handle_code(event: Any, admin_id: Optional[int], state: dict):
+    """Handle verification OTP input."""
+    user_id = event.sender_id
+    user_data = state.get("login_sessions", {}).get(str(user_id))
+    if not user_data or user_data.get("step") != "code":
+        return
+        
+    text = event.text.strip()
+    if text.lower() == "/cancel":
+        await handle_cancel(event, admin_id, state)
+        return
+        
+    code = text.replace(' ', '')
+    if not code.isdigit() or not (4 <= len(code) <= 6):
+        await event.reply("❌ Invalid OTP format. Please send digits only (4 to 6 numbers).\nExample: `1 2 3 4 5`.")
+        return
+        
+    user_client = None
+    try:
+        session = StringSession(user_data["session_string"])
+        user_client = TelegramClient(session, user_data["api_id"], user_data["api_hash"])
+        await user_client.connect()
+        
+        try:
+            await user_client.sign_in(
+                phone=user_data["phone"],
+                code=code,
+                phone_code_hash=user_data["phone_code_hash"]
+            )
+            await complete_user_login(event, user_id, user_client, state)
+        except SessionPasswordNeededError:
+            state["login_sessions"][str(user_id)]["session_string"] = user_client.session.save()
+            state["login_sessions"][str(user_id)]["step"] = "2fa"
+            await save_state(state)
+            await user_client.disconnect()
+            await event.reply(
+                "🔐 **Two-Step Verification (2FA) is enabled on this account.**\n\n"
+                "Please enter your 2FA password:\n"
+                "Enter `/cancel` to abort.",
+                parse_mode='markdown'
+            )
+        except PhoneCodeInvalidError:
+            await event.reply("❌ Invalid OTP code. Please check and try again.")
+            await user_client.disconnect()
+        except PhoneCodeExpiredError:
+            await event.reply("❌ OTP code expired. Please restart with `/login`.")
+            if str(user_id) in state.get("login_sessions", {}):
+                del state["login_sessions"][str(user_id)]
+                await save_state(state)
+            await user_client.disconnect()
+            
+    except Exception as e:
+        logger.error(f"Error during sign_in for user {user_id}: {e}")
+        await event.reply(f"❌ Error signing in: {e}")
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+
+
+async def handle_2fa(event: Any, admin_id: Optional[int], state: dict):
+    """Handle 2FA password entry."""
+    user_id = event.sender_id
+    user_data = state.get("login_sessions", {}).get(str(user_id))
+    if not user_data or user_data.get("step") != "2fa":
+        return
+        
+    password = event.text.strip()
+    if password.lower() == "/cancel":
+        await handle_cancel(event, admin_id, state)
+        return
+        
+    user_client = None
+    try:
+        session = StringSession(user_data["session_string"])
+        user_client = TelegramClient(session, user_data["api_id"], user_data["api_hash"])
+        await user_client.connect()
+        
+        await user_client.sign_in(password=password)
+        await complete_user_login(event, user_id, user_client, state)
+    except PasswordHashInvalidError:
+        await event.reply("❌ Incorrect 2FA password. Please try again or `/cancel` to abort.")
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"2FA login error for user {user_id}: {e}")
+        await event.reply(f"❌ 2FA error: {e}")
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+
+
+async def handle_cancel(event: Any, admin_id: Optional[int], state: dict):
+    """Handle /cancel command to abort login state."""
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    if str(user_id) in state.get("login_sessions", {}):
+        del state["login_sessions"][str(user_id)]
+        await save_state(state)
+        await event.reply("✅ Active login process has been cancelled.")
+    else:
+        await event.reply("ℹ️ No active login process to cancel.")
+
+
+async def handle_logout(event: Any, admin_id: Optional[int], state: dict):
+    """Handle /logout command."""
+    if not event.is_private:
+        await event.reply("❌ Please use this command in private chat.")
+        return
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    if not user_session:
+        await event.reply("❌ You are not logged in.")
+        return
+        
+    user_session_file = get_user_session_file(user_id)
+    if os.path.exists(user_session_file):
+        try:
+            os.remove(user_session_file)
+        except OSError:
+            pass
+            
+    if str(user_id) in state.get("user_sessions", {}):
         del state["user_sessions"][str(user_id)]
-    
-    # Disconnect and remove active user client
+        await save_state(state)
+        
     global ACTIVE_USER_CLIENTS
     if str(user_id) in ACTIVE_USER_CLIENTS:
         try:
             await ACTIVE_USER_CLIENTS[str(user_id)].disconnect()
-        except:
+        except Exception:
             pass
         del ACTIVE_USER_CLIENTS[str(user_id)]
-    
-    await save_state(state)
-    
+        
     await event.reply("✅ Successfully logged out. Your session has been removed.")
 
 
-async def handle_mystatus(event, admin_id, state):
-    """Handle /mystatus command to show user session status"""
+async def handle_mystatus(event: Any, admin_id: Optional[int], state: dict):
+    """Handle /mystatus command."""
     if not event.is_private:
-        await event.reply("❌ Please use this command in private chat.")
         return
-    
     user_id = event.sender_id
     user_session = state.get("user_sessions", {}).get(str(user_id))
-    
     if not user_session:
-        await event.reply(
-            "❌ **You are not logged in.**\n\n"
-            "To login with your own account:\n"
-            "1. Use /login command\n"
-            "2. Follow the steps to enter:\n"
-            "   - API_ID\n"
-            "   - API_HASH\n"
-            "   - Phone number\n"
-            "   - Verification code\n"
-            "   - 2FA password (if enabled)"
-        )
+        await event.reply("❌ **You are not logged in.** Use `/login` to connect your account.")
         return
-    
-    # Calculate login duration
+        
     login_time = user_session.get("login_time", time.time())
-    duration = time.time() - login_time
+    duration = max(0, time.time() - login_time)
     hours = int(duration // 3600)
     minutes = int((duration % 3600) // 60)
     
-    # Check if user has personal channel
     channel_id = user_session.get("channel_id")
-    channel_status = "✅ Set" if channel_id else "❌ Not set"
+    channel_info = f"• Channel ID: `{channel_id}`" if channel_id else "• Channel: ❌ Not set (use `/setmychannel`)"
     
-    if channel_id:
-        try:
-            entity = await event.client.get_entity(channel_id)
-            channel_name = getattr(entity, 'title', 'Unknown')
-            channel_info = f"• Channel: {channel_name}\n• ID: {channel_id}"
-        except:
-            channel_info = f"• Channel ID: {channel_id} (Unable to access)"
-    else:
-        channel_info = "• Use /setchannel to set your personal channel"
-    
-    # FIXED: Add await to get_queue_stats() call
-    # Get queue stats for this user
-    try:
-        queue_stats = await MEDIA_QUEUE.get_queue_stats()
-        pending_count = queue_stats.get('pending_by_user', {}).get(str(user_id), 0)
-    except Exception as e:
-        console.print(f"[red]Error getting queue stats: {e}[/red]")
-        pending_count = 0
+    stats = await MEDIA_QUEUE.get_queue_stats() if MEDIA_QUEUE else {}
+    pending_count = stats.get('pending_by_user', {}).get(str(user_id), 0)
     
     await event.reply(
-        f"✅ **Logged In**\n\n"
-        f"👤 **Account Details:**\n"
+        f"✅ **Account Status: CONNECTED**\n\n"
+        f"👤 **Details:**\n"
         f"• Name: {user_session.get('first_name', 'Unknown')} {user_session.get('last_name', '')}\n"
         f"• Username: @{user_session.get('username', 'Not set')}\n"
-        f"• Phone: {user_session.get('phone', 'Unknown')}\n"
-        f"• API_ID: {user_session.get('api_id')}\n"
-        f"• Logged in for: {hours}h {minutes}m\n\n"
-        f"📱 **Settings:**\n"
-        f"• Personal Channel: {channel_status}\n"
+        f"• User ID: `{user_id}`\n"
+        f"• Connected for: {hours}h {minutes}m\n\n"
+        f"📢 **Channel Configuration:**\n"
         f"{channel_info}\n\n"
-        f"📥 **Status:**\n"
-        f"• Self-destructing media monitoring: ✅ Active\n"
-        f"• Files saved to your channel: {'✅' if channel_id else '❌'}\n"
-        f"• Pending queued media: {pending_count}\n"
-        f"• Offline media recovery: ✅ Enabled\n\n"
-        f"⚠️ **Commands:**\n"
-        f"• Check missed media (last 48h): /checkmissed\n"
-        f"• Use /logout when done\n"
-        f"• Session stored securely"
+        f"📥 **Queue & Recovery:**\n"
+        f"• Pending media in queue: {pending_count}\n"
+        f"• 48h offline recovery: ✅ Active"
     )
 
-async def handle_mychannel(event, admin_id, state):
-    """Show user's personal channel configuration"""
+
+async def handle_setmychannel(event: Any, admin_id: Optional[int], state: dict):
+    """Handle /setmychannel <channel_id>."""
     if not event.is_private:
-        await event.reply("❌ Please use this command in private chat.")
         return
-    
     user_id = event.sender_id
     user_session = state.get("user_sessions", {}).get(str(user_id))
-    
     if not user_session:
-        await event.reply("❌ You are not logged in. Use /login first.")
+        await event.reply("❌ You are not logged in. Use `/login` first.")
         return
-    
-    channel_id = user_session.get("channel_id")
-    
-    if channel_id:
-        try:
-            channel_id_int = int(channel_id)
-            
-            if channel_id_int >= 0:
-                await event.reply(
-                    "⚠️ **INVALID CHANNEL ID FORMAT!**\n\n"
-                    "Your current channel ID is a **USER ID** (positive number).\n"
-                    "**Channel IDs must start with `-100`** (negative number).\n\n"
-                    f"**Current (Wrong):** `{channel_id}`\n"
-                    f"**Should be like:** `-1001234567890`\n\n"
-                    "**To fix this:**\n"
-                    "Use `/setmychannel -1001234567890` with a valid channel ID"
-                )
-                return
-            
-            try:
-                entity = await event.client.get_entity(channel_id_int)
-                await event.reply(
-                    f"📢 **Your Personal Channel**\n\n"
-                    f"• Name: {getattr(entity, 'title', 'Unknown')}\n"
-                    f"• ID: `{channel_id}`\n"
-                    f"• Username: @{getattr(entity, 'username', 'None')}\n\n"
-                    f"**Status:** ✅ Configured\n"
-                    f"**Test with:** /mychanneltest\n"
-                    f"**Update with:** /setmychannel -1001234567890"
-                )
-            except Exception as e:
-                await event.reply(
-                    f"⚠️ **Your Personal Channel**\n\n"
-                    f"Channel ID: `{channel_id}`\n\n"
-                    f"**Warning:** Cannot access this channel\n"
-                    f"Error: {str(e)}\n\n"
-                    f"**Test with:** /mychanneltest\n"
-                    f"**Update with:** /setmychannel -1001234567890"
-                )
-        except ValueError:
-            await event.reply(
-                f"⚠️ **Invalid Channel ID Format!**\n"
-                f"Your channel ID `{channel_id}` is not a valid number.\n"
-                f"Please use `/setmychannel -1001234567890` to set a proper channel."
-            )
-    else:
-        await event.reply(
-            "⚠️ **You have not set a personal channel!**\n\n"
-            "**What this means:**\n"
-            "Your self-destructing media will only go to the bot's global channel.\n\n"
-            "**To set your personal channel:**\n"
-            "1. Create a channel/supergroup\n"
-            "2. Get its ID (add @getidsbot to get the ID)\n"
-            "3. Use `/setmychannel -1001234567890` to set it\n\n"
-            "**Benefits:**\n"
-            "• Your media in YOUR channel\n"
-            "• Better organization\n"
-            "• Dual backup system"
-        )
-
-async def handle_mychanneltest(event, admin_id, state):
-    """Test user's personal channel access"""
-    if not event.is_private:
-        await event.reply("❌ Please use this command in private chat.")
-        return
-    
-    user_id = event.sender_id
-    user_session = state.get("user_sessions", {}).get(str(user_id))
-    
-    if not user_session:
-        await event.reply("❌ You are not logged in. Use /login first.")
-        return
-    
-    channel_id = user_session.get("channel_id")
-    
-    if not channel_id:
-        await event.reply("❌ You have not set a channel. Use /setchannel first.")
-        return
-    
-    try:
-        await event.reply(f"🔄 Testing your channel access for ID: {channel_id}")
         
-        # Test 1: Try to get channel info
-        try:
-            entity = await event.client.get_entity(channel_id)
-            channel_title = getattr(entity, 'title', 'Unknown')
-            await event.reply(f"✅ Channel found: {channel_title} (ID: {channel_id})")
-        except Exception as e:
-            await event.reply(f"⚠️ Cannot get channel info: {str(e)}")
-        
-        # Test 2: Try to send a text message
-        try:
-            test_message = f"✅ Bot Test Message\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nBot: @{(await event.client.get_me()).username}"
-            await event.client.send_message(entity=channel_id, message=test_message)
-            await event.reply(f"✅ Test message sent to your channel successfully!")
-        except Exception as e:
-            await event.reply(f"❌ Failed to send test message: {str(e)}")
-            await event.reply("⚠️ Make sure:\n1. You have 'Send Messages' permission in this channel\n2. Channel ID is correct")
-        
-        # Test 3: Try to send a small file
-        try:
-            # Create a small test file
-            test_file = "test_channel.txt"
-            with open(test_file, "w") as f:
-                f.write(f"Test file for your channel\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            await event.client.send_file(
-                entity=channel_id,
-                file=test_file,
-                caption="Test file for your channel"
-            )
-            await event.reply(f"✅ Test file sent to your channel successfully!")
-            
-            # Clean up
-            os.remove(test_file)
-        except Exception as e:
-            await event.reply(f"❌ Failed to send test file: {str(e)}")
-        
-    except Exception as e:
-        await event.reply(f"❌ Error testing your channel: {str(e)}")
-
-
-# ===== NEW COMMAND HANDLERS FROM FILE 2 =====
-async def handle_checkmissed(event, admin_id, state):
-    """Handle /checkmissed command - Check for missed self-destructing media in last 48 hours"""
-    # REMOVE the admin check from here since we're handling it in enhanced version
-    # if not await is_admin(event, admin_id):
-    #     await event.reply("❌ You are not authorized to use this command.")
-    #     return
-    
-    if not event.is_private:
-        await event.reply("❌ Please use this command in private chat.")
-        return
-    
-    user_id = event.sender_id
-    user_session = state.get("user_sessions", {}).get(str(user_id))
-    
-    if not user_session:
-        await event.reply("❌ You are not logged in. Use /login first.")
-        return
-    
-    await event.reply("🔄 Checking for missed self-destructing media (last 48 hours)... This may take a while.")
-    
-    try:
-        global ACTIVE_USER_CLIENTS
-        user_client = ACTIVE_USER_CLIENTS.get(str(user_id))
-        
-        if not user_client:
-            user_session_file = get_user_session_file(user_id)
-            if os.path.exists(user_session_file):
-                async with aiofiles.open(user_session_file, mode="r") as f:
-                    session_string = await f.read()
-                
-                session = StringSession(session_string)
-                user_client = TelegramClient(session, user_session["api_id"], user_session["api_hash"])
-                
-                await user_client.connect()
-                if await user_client.is_user_authorized():
-                    console.print(f"[cyan]Loaded user client for {user_id}[/cyan]")
-                else:
-                    await user_client.disconnect()
-                    await event.reply("❌ User session is not authorized.")
-                    return
-            else:
-                await event.reply("❌ User session not found.")
-                return
-        
-        found_count = await check_missed_media(user_id, user_client, state)
-        
-        if not ACTIVE_USER_CLIENTS.get(str(user_id)):
-            await user_client.disconnect()
-        
-        if found_count > 0:
-            await event.reply(
-                f"✅ Found {found_count} missed self-destructing media from last 48 hours.\n\n"
-                f"They have been queued for processing.\n"
-                f"Admin can process them using /process_queue command.\n\n"
-                f"**Queue Status:** /queue_stats"
-            )
-        else:
-            await event.reply("📭 No missed self-destructing media found in the last 48 hours.")
-            
-    except Exception as e:
-        await event.reply(f"❌ Error checking missed media: {str(e)}")
-
-
-async def handle_queue_stats(event, admin_id, state):
-    """Handle /queue_stats command - Show media queue statistics"""
-    if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
-    
-    try:
-        # FIXED: Added await
-        stats = await MEDIA_QUEUE.get_queue_stats()
-        
-        pending_count = stats.get('pending_count', 0)
-        processing_count = stats.get('processing_count', 0)
-        processed_count = stats.get('processed_count', 0)
-        failed_count = stats.get('failed_count', 0)
-        total_processed = stats.get('total_processed', 0)
-        
-        message = (
-            f"📊 **Media Queue Statistics**\n\n"
-            f"• **Pending:** {pending_count}\n"
-            f"• **Processing:** {processing_count}\n"
-            f"• **Processed:** {processed_count}\n"
-            f"• **Failed:** {failed_count}\n"
-            f"• **Total Processed:** {total_processed}\n\n"
-        )
-        
-        if 'pending_by_user' in stats and stats['pending_by_user']:
-            message += "**Pending by User:**\n"
-            for user_id, count in stats['pending_by_user'].items():
-                user_session = state.get("user_sessions", {}).get(str(user_id))
-                if user_session:
-                    username = user_session.get('username', f'User {user_id}')
-                    message += f"• @{username}: {count} items\n"
-                else:
-                    message += f"• User {user_id}: {count} items\n"
-        
-        message += f"\n**Commands:**\n• Process queue: /process_queue\n• Force check missed: /checkmissed"
-        
-        await event.reply(message, parse_mode='markdown')
-        
-    except Exception as e:
-        await event.reply(f"❌ Error getting queue stats: {str(e)}")
-
-
-async def handle_process_queue(event, admin_id, state):
-    """Handle /process_queue command - Process queued media"""
-    if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
-    
-    try:
-        await event.reply("🔄 Processing queued media... This may take a while.")
-        await process_queued_media()
-        await event.reply("✅ Queue processing completed! Check /queue_stats for updated statistics.")
-    except Exception as e:
-        await event.reply(f"❌ Error processing queue: {str(e)}")
-# ===== END NEW COMMAND HANDLERS =====
-
-
-# File management commands
-async def handle_files(event, admin_id):
-    """List all files in the media folder"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        def list_media_files(directory, max_depth=3, current_depth=0):
-            """Recursively list files and folders in media directory with depth limit"""
-            if not os.path.isdir(directory):
-                return f"The directory {directory} does not exist."
-            
-            if current_depth > max_depth:
-                return ""
-            
-            # Get relative path from Media folder
-            rel_path = os.path.relpath(directory, all_media_dir)
-            if rel_path == ".":
-                result = "📁 **Media Folder Structure:**\n\n"
-            else:
-                folder_name = os.path.basename(directory)
-                result = f"{'  ' * (current_depth-1)}└── 📁 {folder_name}\n"
-            
-            try:
-                # List directories first
-                items = os.listdir(directory)
-                dirs = []
-                files = []
-                
-                for item in items:
-                    if item.startswith('.'):
-                        continue
-                    item_path = os.path.join(directory, item)
-                    if os.path.isdir(item_path):
-                        dirs.append(item)
-                    else:
-                        files.append(item)
-                
-                # Sort alphabetically
-                dirs.sort()
-                files.sort()
-                
-                # Add directories
-                for dir_name in dirs:
-                    dir_path = os.path.join(directory, dir_name)
-                    # Count files in directory
-                    file_count = sum(len(files) for _, _, files in os.walk(dir_path))
-                    result += f"{'  ' * current_depth}📁 {dir_name}/ ({file_count} items)\n"
-                    result += list_media_files(dir_path, max_depth, current_depth + 1)
-                
-                # Add files
-                for file_name in files[:50]:  # Limit to 50 files per directory
-                    file_path = os.path.join(directory, file_name)
-                    try:
-                        size = os.path.getsize(file_path)
-                        # Format size appropriately
-                        if size < 1024:  # Bytes
-                            size_str = f" {size}B"
-                        elif size < 1024 * 1024:  # KB
-                            size_str = f" {size/1024:.1f}KB"
-                        else:  # MB or GB
-                            if size < 1024 * 1024 * 1024:  # MB
-                                size_str = f" {size/(1024*1024):.1f}MB"
-                            else:  # GB
-                                size_str = f" {size/(1024*1024*1024):.2f}GB"
-                        
-                        # Get file icon based on extension
-                        ext = os.path.splitext(file_name)[1].lower()
-                        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
-                            icon = "🖼️"
-                        elif ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm']:
-                            icon = "🎬"
-                        elif ext in ['.mp3', '.wav', '.flac', '.m4a', '.ogg']:
-                            icon = "🎵"
-                        elif ext in ['.zip', '.rar', '.7z', '.tar', '.gz']:
-                            icon = "🗜️"
-                        elif ext in ['.txt', '.log', '.md', '.json', '.py', '.js', '.html', '.css']:
-                            icon = "📄"
-                        else:
-                            icon = "📎"
-                            
-                        result += f"{'  ' * current_depth}{icon} {file_name}{size_str}\n"
-                    except:
-                        result += f"{'  ' * current_depth}📎 {file_name}\n"
-                
-                if len(files) > 50:
-                    result += f"{'  ' * current_depth}... and {len(files) - 50} more files\n"
-                    
-            except PermissionError:
-                result += f"{'  ' * current_depth}⚠️ Permission denied\n"
-            except Exception as e:
-                result += f"{'  ' * current_depth}⚠️ Error: {str(e)[:50]}...\n"
-            
-            return result
-        
-        # Get statistics
-        total_folders = 0
-        total_files = 0
-        total_size = 0
-        
-        for root, dirs, files in os.walk(all_media_dir):
-            # Skip hidden directories
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            total_folders += len(dirs)
-            total_files += len(files)
-            
-            for file in files:
-                if file.startswith('.'):
-                    continue
-                file_path = os.path.join(root, file)
-                try:
-                    total_size += os.path.getsize(file_path)
-                except:
-                    pass
-        
-        # Format total size
-        if total_size < 1024 * 1024:  # KB
-            total_size_str = f"{total_size/1024:.1f} KB"
-        elif total_size < 1024 * 1024 * 1024:  # MB
-            total_size_str = f"{total_size/(1024*1024):.1f} MB"
-        else:  # GB
-            total_size_str = f"{total_size/(1024*1024*1024):.2f} GB"
-        
-        files_list = list_media_files(all_media_dir)
-        summary = f"\n📊 **Summary:** {total_folders} folders, {total_files} files, {total_size_str}"
-        
-        # Combine summary with file list
-        full_message = files_list + summary
-        
-        # Split long messages (Telegram has 4096 character limit)
-        if len(full_message) > 4000:
-            # Send summary first
-            await event.reply(f"📁 **Media Folder Overview**{summary}", parse_mode='markdown')
-            
-            # Then send file list in chunks
-            chunks = [files_list[i:i+4000] for i in range(0, len(files_list), 4000)]
-            for i, chunk in enumerate(chunks):
-                await event.reply(f"**File List (Part {i+1}/{len(chunks)}):**\n```\n{chunk}\n```", parse_mode='markdown')
-        else:
-            await event.reply(full_message, parse_mode='markdown')
-            
-    except Exception as e:
-        logger.error(f"Error in /files command: {str(e)}")
-        await event.reply(f"❌ Error listing files: {str(e)}")
-
-
-async def handle_check(event, admin_id):
-    """Check for new files in media folder"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        def get_recent_files(directory, hours=24):
-            """Get files modified in the last specified hours"""
-            recent_files = []
-            cutoff_time = time.time() - (hours * 3600)
-            
-            for root, dirs, files in os.walk(directory):
-                for file in files:
-                    if file.startswith('.'):
-                        continue
-                    file_path = os.path.join(root, file)
-                    try:
-                        mtime = os.path.getmtime(file_path)
-                        if mtime > cutoff_time:
-                            size = os.path.getsize(file_path)
-                            size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.1f} MB"
-                            recent_files.append((file_path, mtime, size_str))
-                    except:
-                        continue
-            
-            # Sort by modification time (newest first)
-            recent_files.sort(key=lambda x: x[1], reverse=True)
-            return recent_files
-        
-        recent_files = get_recent_files(all_media_dir, hours=24)
-        
-        if recent_files:
-            message = "📁 **Recently Modified Files (Last 24 Hours):**\n\n"
-            for file_path, mtime, size_str in recent_files[:20]:  # Limit to 20 files
-                rel_path = os.path.relpath(file_path, all_media_dir)
-                timestamp = time.strftime('%Y-%m-d %H:%M', time.localtime(mtime))
-                message += f"• `{rel_path}`\n  📏 {size_str} | 🕒 {timestamp}\n\n"
-            
-            if len(recent_files) > 20:
-                message += f"\n... and {len(recent_files) - 20} more files"
-            
-            await event.reply(message, parse_mode='markdown')
-        else:
-            await event.reply("📭 No files modified in the last 24 hours.")
-            
-    except Exception as e:
-        logger.error(f"Error in /check command: {str(e)}")
-        await event.reply(f"❌ Error checking files: {str(e)}")
-
-async def handle_download(event, admin_id):
-    """Download a specific file"""
-    if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
-    
-    try:
-        # Extract file path from command
-        args = event.text.split()
-        if len(args) < 2:
-            await event.reply(
-                "❌ **Usage:** `/download <file_path>`\n"
-                "**Example:** `/download Media/00 - A - @username - 12345/file.jpg`\n\n"
-                "**Note:** Use `/files` command to see available files and their paths.",
-                parse_mode='markdown'
-            )
-            return
-        
-        file_path = ' '.join(args[1:]).strip()
-        
-        # ✅ Option 1: Check if it's an absolute path
-        if os.path.isabs(file_path):
-            # Absolute path provided, use as is
-            pass
-        # ✅ Option 2: Check if it's relative to Media folder
-        elif not file_path.startswith("Media/") and not file_path.startswith("Media\\"):
-            # Try with Media folder prefix
-            file_path = os.path.join("Media", file_path)
-        
-        console.print(f"[cyan]Looking for file: {file_path}[/cyan]")
-        
-        # Check if file exists
-        if not os.path.exists(file_path):
-            # Try alternative search
-            await event.reply(f"❌ File not found: `{file_path}`\n\n**Searching for file...**", parse_mode='markdown')
-            
-            # Search in Media folder recursively
-            found_files = []
-            for root, dirs, files in os.walk("Media"):
-                for file in files:
-                    if file_path in os.path.join(root, file) or file_path in file:
-                        found_files.append(os.path.join(root, file))
-            
-            if found_files:
-                if len(found_files) == 1:
-                    file_path = found_files[0]
-                    await event.reply(f"✅ Found file: `{file_path}`\n\nProceeding with download...", parse_mode='markdown')
-                else:
-                    message = f"🔍 **Multiple files found containing '{file_path}':**\n\n"
-                    for i, f in enumerate(found_files[:10], 1):
-                        message += f"{i}. `{f}`\n"
-                    
-                    if len(found_files) > 10:
-                        message += f"\n... and {len(found_files) - 10} more files"
-                    
-                    message += "\n\n**Please use the full path from the list above.**"
-                    await event.reply(message, parse_mode='markdown')
-                    return
-            else:
-                # Show Media folder structure
-                await event.reply(
-                    f"❌ **File not found!**\n\n"
-                    f"**Search Path:** `{file_path}`\n"
-                    f"**Media Folder:** `{os.path.abspath('Media')}`\n\n"
-                    f"**Try:**\n"
-                    f"1. Use `/files` to list all available files\n"
-                    f"2. Copy the exact file path from `/files` output\n"
-                    f"3. Use `/download <exact_path>`"
-                )
-                return
-        
-        # Check if it's a directory
-        if os.path.isdir(file_path):
-            # Count files in directory
-            file_count = sum([len(files) for r, d, files in os.walk(file_path)])
-            await event.reply(
-                f"❌ `{file_path}` is a directory (contains {file_count} files).\n\n"
-                f"To download all files from this directory, use:\n"
-                f"`/download_zip {os.path.relpath(file_path, 'Media') if file_path.startswith('Media') else file_path}`",
-                parse_mode='markdown'
-            )
-            return
-        
-        # Check file size
-        file_size = os.path.getsize(file_path)
-        file_size_mb = file_size / (1024 * 1024)
-        
-        if file_size > 1500 * 1024 * 1024:  # 1.5GB
-            await event.reply(
-                f"⚠️ File is too large ({file_size_mb:.1f} MB).\n"
-                f"Telegram bots have a 2GB file size limit.\n\n"
-                f"Consider using `/download_zip` for large files."
-            )
-            return
-        
-        # Send the file
-        await event.reply(f"📤 **Downloading file...**\n`{file_path}`\nSize: {file_size_mb:.2f} MB", parse_mode='markdown')
-        
-        # Show progress for large files
-        if file_size > 10 * 1024 * 1024:  # 10MB
-            progress = RichDownloadProgress(os.path.basename(file_path), file_size)
-            progress.update(1)
-            await asyncio.sleep(0.5)
-            progress.close()
-        
-        # Get file info for caption
-        file_extension = os.path.splitext(file_path)[1].lower()
-        file_types = {
-            '.jpg': '🖼️ Photo', '.jpeg': '🖼️ Photo', '.png': '🖼️ Photo', 
-            '.gif': '🖼️ GIF', '.bmp': '🖼️ Image', '.webp': '🖼️ Image',
-            '.mp4': '🎬 Video', '.avi': '🎬 Video', '.mkv': '🎬 Video', 
-            '.mov': '🎬 Video', '.wmv': '🎬 Video', '.flv': '🎬 Video', '.webm': '🎬 Video',
-            '.mp3': '🎵 Audio', '.wav': '🎵 Audio', '.flac': '🎵 Audio', 
-            '.m4a': '🎵 Audio', '.ogg': '🎵 Audio',
-            '.zip': '🗜️ Archive', '.rar': '🗜️ Archive', '.7z': '🗜️ Archive',
-            '.txt': '📄 Text', '.log': '📄 Log', '.md': '📄 Markdown',
-            '.json': '📄 JSON', '.py': '🐍 Python'
-        }
-        
-        file_type = file_types.get(file_extension, '📎 File')
-        
-        caption = (
-            f"{file_type}\n"
-            f"📁 File: {os.path.basename(file_path)}\n"
-            f"📊 Size: {file_size_mb:.2f} MB\n"
-            f"📍 Path: {os.path.relpath(file_path, 'Media') if file_path.startswith('Media') else file_path}\n"
-            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        await event.client.send_file(
-            event.chat_id,
-            file_path,
-            caption=caption,
-            force_document=True  # Force as document to avoid compression
-        )
-        
-        await event.reply(f"✅ **Download complete!**\n`{file_path}`", parse_mode='markdown')
-        
-    except Exception as e:
-        logger.error(f"Error in /download command: {str(e)}")
-        await event.reply(
-            f"❌ **Error downloading file:**\n"
-            f"`{str(e)[:200]}`\n\n"
-            f"**Debug Info:**\n"
-            f"• File Path: `{file_path}`\n"
-            f"• File Exists: `{os.path.exists(file_path) if 'file_path' in locals() else 'Unknown'}`\n"
-            f"• Is Directory: `{os.path.isdir(file_path) if 'file_path' in locals() else 'Unknown'}`"
-        )
-
-async def handle_download_zip(event, admin_id):
-    """Download a folder as ZIP"""
-    if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
-    
-    try:
-        args = event.text.split()
-        if len(args) < 2:
-            await event.reply(
-                "❌ **Usage:** `/download_zip <folder_path>`\n"
-                "**Example:** `/download_zip Media/00 - A - @username - 12345`\n\n"
-                "**Note:** This command creates a ZIP archive of the specified folder.",
-                parse_mode='markdown'
-            )
-            return
-        
-        folder_path = ' '.join(args[1:]).strip()
-        
-        # Add Media prefix if not already
-        if not folder_path.startswith("Media/") and not folder_path.startswith("Media\\"):
-            folder_path = os.path.join("Media", folder_path)
-        
-        if not os.path.exists(folder_path):
-            await event.reply(f"❌ Folder not found: `{folder_path}`", parse_mode='markdown')
-            return
-        
-        if not os.path.isdir(folder_path):
-            await event.reply(f"❌ `{folder_path}` is not a directory.", parse_mode='markdown')
-            return
-        
-        # Count files in folder
-        total_files = 0
-        total_size = 0
-        for root, dirs, files in os.walk(folder_path):
-            total_files += len(files)
-            for file in files:
-                try:
-                    total_size += os.path.getsize(os.path.join(root, file))
-                except:
-                    pass
-        
-        total_size_mb = total_size / (1024 * 1024)
-        
-        if total_files == 0:
-            await event.reply(f"❌ Folder is empty: `{folder_path}`", parse_mode='markdown')
-            return
-        
-        await event.reply(
-            f"📦 **Creating ZIP archive...**\n\n"
-            f"• Folder: `{folder_path}`\n"
-            f"• Files: {total_files}\n"
-            f"• Size: {total_size_mb:.1f} MB\n\n"
-            f"This may take a moment..."
-        )
-        
-        # Create ZIP file
-        timestamp = int(time.time())
-        folder_name = os.path.basename(folder_path.rstrip('/\\'))
-        zip_filename = f"{folder_name}_{timestamp}.zip"
-        
-        total_zipped = 0
-        zip_size = 0
-        
-        with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(folder_path):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, folder_path)
-                    
-                    try:
-                        zipf.write(file_path, arcname)
-                        total_zipped += 1
-                        zip_size += os.path.getsize(file_path)
-                        
-                        # Update progress every 10 files
-                        if total_zipped % 10 == 0:
-                            await event.edit(
-                                f"📦 **ZIP Progress...**\n"
-                                f"• Files added: {total_zipped}/{total_files}\n"
-                                f"• Current size: {zip_size/(1024*1024):.1f} MB"
-                            )
-                    except Exception as e:
-                        logger.error(f"Error adding {file_path} to ZIP: {str(e)}")
-        
-        final_zip_size = os.path.getsize(zip_filename)
-        final_zip_size_mb = final_zip_size / (1024 * 1024)
-        
-        await event.reply(
-            f"✅ **ZIP created successfully!**\n\n"
-            f"• Folder: `{folder_path}`\n"
-            f"• Files: {total_zipped}/{total_files}\n"
-            f"• ZIP Size: {final_zip_size_mb:.1f} MB\n\n"
-            f"Sending ZIP file..."
-        )
-        
-        # Check if ZIP is too large
-        if final_zip_size > 1900 * 1024 * 1024:  # 1.9GB
-            await event.reply(
-                f"⚠️ ZIP file is too large ({final_zip_size_mb:.1f} MB).\n"
-                f"Telegram bots have a 2GB file size limit.\n\n"
-                f"Consider splitting the folder into smaller parts."
-            )
-            os.remove(zip_filename)
-            return
-        
-        # Send ZIP file
-        await event.client.send_file(
-            event.chat_id,
-            zip_filename,
-            caption=f"📦 ZIP Archive\n"
-                   f"📁 Folder: {folder_name}\n"
-                   f"📊 Files: {total_zipped}\n"
-                   f"📏 Size: {final_zip_size_mb:.1f} MB\n"
-                   f"🕒 Created: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            force_document=True
-        )
-        
-        # Clean up
-        os.remove(zip_filename)
-        
-    except Exception as e:
-        logger.error(f"Error in /download_zip command: {str(e)}")
-        await event.reply(f"❌ Error creating ZIP: {str(e)}")
-        
-        # Clean up on error
-        try:
-            if os.path.exists(zip_filename):
-                os.remove(zip_filename)
-        except:
-            pass
-
-async def handle_delete(event, admin_id):
-    """Delete a specific file"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        # Extract file path from command
-        args = event.text.split()
-        if len(args) < 2:
-            await event.reply("❌ Usage: /delete <file_path>\nExample: /delete Media/file.jpg")
-            return
-        
-        file_path = ' '.join(args[1:]).strip()
-        
-        # Check if file exists
-        if not os.path.exists(file_path):
-            await event.reply(f"❌ File not found: `{file_path}`", parse_mode='markdown')
-            return
-        
-        # Check if it's a directory
-        if os.path.isdir(file_path):
-            await event.reply(f"❌ `{file_path}` is a directory. Use /deletedir to delete directories.", parse_mode='markdown')
-            return
-        
-        # Get file info before deletion
-        file_size = os.path.getsize(file_path)
-        file_size_str = f"{file_size/1024:.1f} KB" if file_size < 1024*1024 else f"{file_size/(1024*1024):.1f} MB"
-        
-        # Confirm deletion
-        await event.reply(
-            f"⚠️ Are you sure you want to delete this file?\n\n"
-            f"📁 `{file_path}`\n"
-            f"📏 Size: {file_size_str}\n\n"
-            f"Type `/confirm_delete {file_path}` to confirm.",
-            parse_mode='markdown'
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in /delete command: {str(e)}")
-        await event.reply(f"❌ Error: {str(e)}")
-
-
-async def handle_confirm_delete(event, admin_id):
-    """Confirm and delete a file"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        # Extract file path from command
-        args = event.text.split()
-        if len(args) < 2:
-            return
-        
-        file_path = ' '.join(args[1:]).strip()
-        
-        # Check if file exists
-        if not os.path.exists(file_path):
-            await event.reply(f"❌ File not found: `{file_path}`", parse_mode='markdown')
-            return
-        
-        # Delete the file
-        os.remove(file_path)
-        await event.reply(f"✅ Successfully deleted: `{file_path}`", parse_mode='markdown')
-        
-    except Exception as e:
-        logger.error(f"Error in /confirm_delete command: {str(e)}")
-        await event.reply(f"❌ Error deleting file: {str(e)}")
-
-
-async def handle_all(event, admin_id):
-    """Download all media files from media folder"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        # Get all media files
-        media_files = []
-        total_size = 0
-        
-        for root, dirs, files in os.walk(all_media_dir):
-            for file in files:
-                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
-                                         '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm')):
-                    file_path = os.path.join(root, file)
-                    size = os.path.getsize(file_path)
-                    total_size += size
-                    media_files.append((file_path, size))
-        
-        if not media_files:
-            await event.reply("📭 No media files found in the media folder.")
-            return
-        
-        # Sort by size (smallest first)
-        media_files.sort(key=lambda x: x[1])
-        
-        total_mb = total_size / (1024 * 1024)
-        await event.reply(
-            f"📊 Found {len(media_files)} media files ({total_mb:.1f} MB total).\n"
-            f"⚠️ Sending all files... This may take a while.\n"
-            f"Files will be sent in batches."
-        )
-        
-        # Send files in batches
-        sent_count = 0
-        batch_size = 10
-        
-        for i in range(0, len(media_files), batch_size):
-            batch = media_files[i:i + batch_size]
-            
-            # Send batch of files
-            for file_path, size in batch:
-                try:
-                    file_size_mb = size / (1024 * 1024)
-                    await event.client.send_file(
-                        event.chat_id,
-                        file_path,
-                        caption=f"📁 {os.path.basename(file_path)} ({file_size_mb:.1f} MB)",
-                        allow_cache=False
-                    )
-                    sent_count += 1
-                    await asyncio.sleep(1)
-                    
-                except Exception as e:
-                    logger.error(f"Error sending file {file_path}: {str(e)}")
-                    await event.reply(f"❌ Failed to send: {os.path.basename(file_path)}")
-            
-            # Update progress
-            if i + batch_size < len(media_files):
-                await event.reply(f"📤 Sent {sent_count}/{len(media_files)} files...")
-                await asyncio.sleep(5)
-        
-        await event.reply(f"✅ Successfully sent {sent_count}/{len(media_files)} media files.")
-        
-    except Exception as e:
-        logger.error(f"Error in /all command: {str(e)}")
-        await event.reply(f"❌ Error sending media files: {str(e)}")
-
-
-async def handle_zip(event, admin_id):
-    """Create and send a ZIP archive"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        # Create temporary ZIP file
-        timestamp = int(time.time())
-        zip_filename = f"media_backup_{timestamp}.zip"
-        
-        await event.reply("📦 Creating ZIP archive... This may take a while.")
-        
-        # Create ZIP file
-        total_files = 0
-        total_size = 0
-        
-        with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(all_media_dir):
-                # Skip hidden directories
-                dirs[:] = [d for d in dirs if not d.startswith('.')]
-                
-                for file in files:
-                    if file.startswith('.'):
-                        continue
-                    
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, all_media_dir)
-                    
-                    try:
-                        zipf.write(file_path, arcname)
-                        total_files += 1
-                        total_size += os.path.getsize(file_path)
-                    except Exception as e:
-                        logger.error(f"Error adding {file_path} to ZIP: {str(e)}")
-        
-        if total_files == 0:
-            await event.reply("📭 No files to add to ZIP archive.")
-            os.remove(zip_filename)
-            return
-        
-        zip_size = os.path.getsize(zip_filename)
-        zip_size_mb = zip_size / (1024 * 1024)
-        
-        await event.reply(
-            f"📦 ZIP archive created successfully!\n"
-            f"• Files: {total_files}\n"
-            f"• Size: {zip_size_mb:.1f} MB"
-        )
-        
-        # Check if ZIP is too large for Telegram
-        if zip_size > 1900 * 1024 * 1024:  # 1.9GB
-            await event.reply(
-                f"⚠️ ZIP file is too large ({zip_size_mb:.1f} MB).\n"
-                f"Telegram bots have a 2GB file size limit.\n"
-                f"Consider creating multiple smaller ZIP files."
-            )
-            os.remove(zip_filename)
-            return
-        
-        # Send the ZIP file
-        await event.client.send_file(
-            event.chat_id,
-            zip_filename,
-            caption=f"📦 Media Backup\n"
-                   f"📁 Files: {total_files}\n"
-                   f"📏 Size: {zip_size_mb:.1f} MB\n"
-                   f"🕒 Created: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        # Clean up
-        os.remove(zip_filename)
-        
-    except Exception as e:
-        logger.error(f"Error in /zip command: {str(e)}")
-        await event.reply(f"❌ Error creating ZIP: {str(e)}")
-        
-        # Clean up on error
-        try:
-            if os.path.exists(zip_filename):
-                os.remove(zip_filename)
-        except:
-            pass
-
-async def handle_ping(event):
-    """Handle ping command with multiple endpoints"""
-
-    # Admin check
-    try:
-        admin_id = int(event.client.admin_id)
-    except Exception:
-        return
-
-    if event.sender_id != admin_id:
-        return
-
-    endpoints = [
-        ("Google", "https://www.google.com"),
-        ("Telegram", "https://api.telegram.org"),
-        ("Cloudflare", "https://1.1.1.1")
-    ]
-
-    results = []
-
-    for name, url in endpoints:
-        try:
-            start_time = time.perf_counter()
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as session:
-                async with session.get(url):
-                    ping_time = round((time.perf_counter() - start_time) * 1000)
-                    results.append(f"{name}: {ping_time} ms")
-        except Exception as e:
-            results.append(f"{name}: Failed")
-
-    await event.reply(
-        "📡 **Ping Results**\n\n" + "\n".join(results),
-        parse_mode="markdown"
-    )
-
-async def handle_setgchannel(event, admin_id, state):
-    """Admin only: Set global channel for BOT files"""
-    if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
-    
-    try:
-        # Extract channel ID from command
-        args = event.text.split()
-        if len(args) < 2:
-            await event.reply(
-                "❌ Usage: /setgchannel <channel_id>\n"
-                "Example: /setgchannel -1001234567890\n\n"
-                "**What this does:**\n"
-                "• Sets the BOT'S GLOBAL channel\n"
-                "• All files downloaded by bot go here\n"
-                "• Users' self-destructing media are COPIED here\n"
-                "• Uses BOT account to send files"
-            )
-            return
-        
-        channel_input = args[1].strip()
-        
-        # ✅ Validate channel ID format
-        if not channel_input.startswith('-100'):
-            await event.reply(
-                "❌ **Invalid Channel ID Format!**\n\n"
-                "**Channel IDs must start with `-100`**\n"
-                "Example: `-1001234567890`\n\n"
-                "**How to get Channel ID:**\n"
-                "1. Add @getidsbot to your channel\n"
-                "2. Send any message in channel\n"
-                "3. Bot will reply with your channel ID\n"
-                "4. Copy the ID (it will look like -1001234567890)"
-            )
-            return
-        
-        # ✅ Check if it's a valid number
-        try:
-            channel_id_int = int(channel_input)
-        except ValueError:
-            await event.reply(
-                "❌ **Invalid Channel ID!**\n"
-                "Channel ID must be a number.\n"
-                "Example: `-1001234567890`"
-            )
-            return
-        
-        # ✅ Check if channel ID is negative (channel/supergroup)
-        if channel_id_int >= 0:
-            await event.reply(
-                "❌ **This is NOT a Channel ID!**\n\n"
-                "You entered a **User ID** (positive number).\n"
-                "Channel IDs are **negative numbers** starting with -100.\n\n"
-                "**Your Input:** `{}`\n"
-                "**Expected Format:** `-1001234567890`".format(channel_input)
-            )
-            return
-        
-        try:
-            channel_entity = await event.client.get_entity(channel_id_int)
-            
-            # ✅ CORRECTED: Calculate proper channel ID
-            if channel_entity.id > 0:
-                # If entity.id is positive (e.g., 123456789)
-                # Convert to -100123456789
-                channel_id = int("-100" + str(channel_entity.id))
-            else:
-                # Already in negative format
-                channel_id = channel_entity.id
-            
-            # ✅ Verify it's actually a channel/supergroup
-            from telethon.tl.types import Channel
-            
-            if isinstance(channel_entity, Channel):
-                channel_type = "Channel" if channel_entity.broadcast else "Supergroup"
-                
-                # Admin sets global channel
-                success = await update_channel_id(str(channel_id))
-                
-                if success:
-                    # Update the client's config
-                    event.client.channel_id = channel_id
-                    
-                    await event.reply(
-                        f"✅ **Bot's Global Channel set successfully!**\n\n"
-                        f"📢 **BOT'S GLOBAL CHANNEL**\n"
-                        f"• Name: {getattr(channel_entity, 'title', 'Unknown')}\n"
-                        f"• ID: `{channel_id}`\n"
-                        f"• Username: @{getattr(channel_entity, 'username', 'None')}\n"
-                        f"• Type: {channel_type}\n\n"
-                        f"**What this does:**\n"
-                        f"1. Files downloaded by the bot go here\n"
-                        f"2. Users' self-destructing media are COPIED here\n"
-                        f"3. Serves as backup/archive for ALL users\n"
-                        f"4. Uses BOT account to send files\n\n"
-                        f"**Test with:** /testchannel\n"
-                        f"**View with:** /currentchannel"
-                    )
-                else:
-                    await event.reply("❌ Failed to update global settings.")
-            else:
-                await event.reply(
-                    "❌ **Not a valid Channel/Supergroup!**\n"
-                    "The entity you provided is not a channel or supergroup.\n"
-                    "Please provide a valid channel ID starting with -100."
-                )
-                
-        except Exception as e:
-            logger.error(f"Error accessing channel {channel_input}: {str(e)}")
-            
-            # Could not access channel, but save anyway if format is correct
-            success = await update_channel_id(str(channel_id_int))
-            
-            if success:
-                event.client.channel_id = channel_id_int
-                
-                await event.reply(
-                    f"⚠️ **Bot's Global Channel set with warning**\n\n"
-                    f"📢 **BOT'S GLOBAL CHANNEL**\n"
-                    f"• Channel ID: `{channel_id_int}`\n\n"
-                    f"**Warning:** Could not verify channel access\n"
-                    f"Make sure the bot is added as admin to this channel.\n"
-                    f"Add @{(await event.client.get_me()).username} as admin.\n\n"
-                    f"**Test with:** /testchannel"
-                )
-            else:
-                await event.reply("❌ Failed to update global settings.")
-            
-    except Exception as e:
-        logger.error(f"Error in /setgchannel command: {str(e)}")
-        await event.reply(f"❌ Error: {str(e)}")
-
-async def handle_setmychannel(event, admin_id, state):
-    """Users only: Set personal channel for YOUR self-destructing media"""
-    if not event.is_private:
-        await event.reply("❌ Please use this command in private chat.")
-        return
-    
-    user_id = event.sender_id
-    user_session = state.get("user_sessions", {}).get(str(user_id))
-    
-    if not user_session:
-        await event.reply("❌ You are not logged in. Use /login first.")
-        return
-    
-    try:
-        # Extract channel ID from command
-        args = event.text.split()
-        if len(args) < 2:
-            await event.reply(
-                "❌ Usage: /setmychannel <channel_id>\n"
-                "Example: /setmychannel -1001234567890\n\n"
-                "**What this does:**\n"
-                "• Sets YOUR PERSONAL channel\n"
-                "• Your self-destructing media goes here\n"
-                "• Uses YOUR account to send files\n"
-                "• Also copied to bot's global channel\n\n"
-                "**How to get Channel ID:**\n"
-                "1. Add @getidsbot to your channel\n"
-                "2. Send any message\n"
-                "3. Copy the ID (starts with -100)"
-            )
-            return
-        
-        channel_input = args[1].strip()
-        
-        # ✅ Validate channel ID format
-        if not channel_input.startswith('-100'):
-            await event.reply(
-                "❌ **Invalid Channel ID Format!**\n\n"
-                "**Channel IDs must start with `-100`**\n"
-                "Example: `-1001234567890`\n\n"
-                "**How to get Channel ID:**\n"
-                "1. Add @getidsbot to your channel\n"
-                "2. Send any message\n"
-                "3. Copy the ID (starts with -100)\n\n"
-                "**Note:** DO NOT use your user ID (positive number)"
-            )
-            return
-        
-        # ✅ Check if it's a valid number
-        try:
-            channel_id_int = int(channel_input)
-        except ValueError:
-            await event.reply(
-                "❌ **Invalid Channel ID!**\n"
-                "Channel ID must be a number.\n"
-                "Example: `-1001234567890`"
-            )
-            return
-        
-        # ✅ Check if channel ID is negative (channel/supergroup)
-        if channel_id_int >= 0:
-            await event.reply(
-                "❌ **This is NOT a Channel ID!**\n\n"
-                "You entered a **User ID** (positive number).\n"
-                "Channel IDs are **negative numbers** starting with -100.\n\n"
-                "**Your Input:** `{}`\n"
-                "**Expected Format:** `-1001234567890`".format(channel_input)
-            )
-            return
-        
-        # Get user's client to access the channel
-        user_session_file = get_user_session_file(user_id)
-        
-        if not os.path.exists(user_session_file):
-            await event.reply("❌ User session not found. Please login again with /login")
-            return
-        
-        # Load user client
-        async with aiofiles.open(user_session_file, mode="r") as f:
-            session_string = await f.read()
-        
-        session = StringSession(session_string)
-        user_client = TelegramClient(session, user_session["api_id"], user_session["api_hash"])
-        
-        await user_client.connect()
-        
-        if not await user_client.is_user_authorized():
-            await user_client.disconnect()
-            await event.reply("❌ Your session is not authorized. Please login again with /login")
-            return
-        
-        try:
-            channel_entity = await user_client.get_entity(channel_id_int)
-            
-            # ✅ CORRECTED: Calculate proper channel ID
-            if channel_entity.id > 0:
-                channel_id = int("-100" + str(channel_entity.id))
-            else:
-                channel_id = channel_entity.id
-            
-            # ✅ Verify it's actually a channel/supergroup
-            from telethon.tl.types import Channel
-            
-            if isinstance(channel_entity, Channel):
-                channel_type = "Channel" if channel_entity.broadcast else "Supergroup"
-                
-                # User sets personal channel
-                success = await update_user_channel_id(user_id, channel_id, state)
-                
-                if success:
-                    await event.reply(
-                        f"✅ **Your Personal Channel set successfully!**\n\n"
-                        f"📢 **YOUR PERSONAL CHANNEL**\n"
-                        f"• Name: {getattr(channel_entity, 'title', 'Unknown')}\n"
-                        f"• ID: `{channel_id}`\n"
-                        f"• Username: @{getattr(channel_entity, 'username', 'None')}\n"
-                        f"• Type: {channel_type}\n\n"
-                        f"**What this does:**\n"
-                        f"1. Your self-destructing media goes here\n"
-                        f"2. Works even when bot was offline\n\n"
-                        f"**Test with:** /mychanneltest\n"
-                        f"**View with:** /mychannel"
-                    )
-                else:
-                    await event.reply("❌ Failed to update your channel.")
-            else:
-                await event.reply(
-                    "❌ **Not a valid Channel/Supergroup!**\n"
-                    "The entity you provided is not a channel or supergroup.\n"
-                    "Please provide a valid channel ID starting with -100."
-                )
-            
-        except Exception as e:
-            logger.error(f"User error accessing channel {channel_input}: {str(e)}")
-            
-            # Could not access channel, but save anyway
-            success = await update_user_channel_id(user_id, channel_id_int, state)
-            
-            if success:
-                await event.reply(
-                    f"⚠️ **Personal Channel set with warning**\n\n"
-                    f"📢 **YOUR PERSONAL CHANNEL**\n"
-                    f"• Channel ID: `{channel_id_int}`\n\n"
-                    f"**Warning:** Could not verify channel access\n"
-                    f"Make sure you have 'Send Messages' permission in this channel.\n\n"
-                    f"**Test with:** /mychanneltest\n\n"
-                    f"**Note:** If channel access fails, media won't be saved!"
-                )
-            else:
-                await event.reply("❌ Failed to update your channel.")
-        
-        await user_client.disconnect()
-        
-    except Exception as e:
-        logger.error(f"Error in user channel setup: {str(e)}")
-        await event.reply(f"❌ Error setting your personal channel: {str(e)}")
-
-async def handle_testchannel(event, admin_id):
-    """Test channel access by sending a test message"""
-    if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
-    
-    channel_id = getattr(event.client, 'channel_id', None)
-    
-    if not channel_id:
-        await event.reply("❌ No channel configured. Use /setchannel first.")
-        return
-    
-    try:
-        await event.reply(f"🔄 Testing channel access for ID: {channel_id}")
-        
-        # Test 1: Try to get channel info
-        try:
-            entity = await event.client.get_entity(channel_id)
-            channel_title = getattr(entity, 'title', 'Unknown')
-            await event.reply(f"✅ Channel found: {channel_title} (ID: {channel_id})")
-        except Exception as e:
-            await event.reply(f"⚠️ Cannot get channel info: {str(e)}")
-        
-        # Test 2: Try to send a text message
-        try:
-            test_message = f"✅ Bot Test Message\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}\nBot: @{(await event.client.get_me()).username}"
-            await event.client.send_message(entity=channel_id, message=test_message)
-            await event.reply(f"✅ Test message sent to channel successfully!")
-        except Exception as e:
-            await event.reply(f"❌ Failed to send test message: {str(e)}")
-            await event.reply("⚠️ Make sure:\n1. Bot is added to channel\n2. Bot has 'Send Messages' permission\n3. Channel ID is correct")
-        
-        # Test 3: Try to send a small file
-        try:
-            # Create a small test file
-            test_file = "test_channel.txt"
-            with open(test_file, "w") as f:
-                f.write(f"Test file for channel\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            await event.client.send_file(
-                entity=channel_id,
-                file=test_file,
-                caption="Test file for channel"
-            )
-            await event.reply(f"✅ Test file sent to channel successfully!")
-            
-            # Clean up
-            os.remove(test_file)
-        except Exception as e:
-            await event.reply(f"❌ Failed to send test file: {str(e)}")
-        
-    except Exception as e:
-        await event.reply(f"❌ Error testing channel: {str(e)}")
-
-
-async def handle_currentchannel(event, admin_id, state):
-    """Show current BOT'S GLOBAL channel configuration (admin only)"""
-    if not await is_admin(event, admin_id):
-        # For users, redirect to mychannel
-        await handle_mychannel(event, admin_id, state)
-        return
-    
-    # Admin sees global channel
-    channel_id = getattr(event.client, 'channel_id', None)
-    
-    if channel_id:
-        try:
-            entity = await event.client.get_entity(channel_id)
-            await event.reply(
-                f"📢 **Bot's Global Channel Configuration**\n\n"
-                f"• Channel: {getattr(entity, 'title', 'Unknown')}\n"
-                f"• ID: {channel_id}\n"
-                f"• Username: @{getattr(entity, 'username', 'None')}\n\n"
-                f"**What this does:**\n"
-                f"• Receives copies of ALL users' self-destructing media\n"
-                f"• Uses BOT account to send files\n"
-                f"• Serves as backup/archive\n\n"
-                f"**Note:** Users set their own channels with /setmychannel"
-            )
-        except Exception as e:
-            await event.reply(
-                f"⚠️ Channel ID is set to {channel_id}, but I can't access it.\n"
-                f"Error: {str(e)}\n"
-                f"Make sure the bot is added as admin to this channel.\n"
-                f"Use /setgchannel to update the channel."
-            )
-    else:
-        await event.reply(
-            "⚠️ **No global channel configured!**\n"
-            "Files from the bot are only being saved locally, not sent to any channel.\n"
-            "Use /setgchannel <channel_id> to configure the bot's global channel.\n\n"
-            "**Note:** Users can set their own personal channels with /setmychannel"
-        )
-
-
-async def handle_help(event, admin_id, state):
-    """Show help message"""
-    if not await is_admin(event, admin_id):
-        # Show user help
-        user_id = event.sender_id
-        is_logged_in = str(user_id) in state.get("user_sessions", {})
-        
-        if is_logged_in:
-            user_help = """
-🤖 **Self-Destructing Media Downloader Bot**
-
-**📢 YOUR PERSONAL CHANNEL (Most Important):**
-/setmychannel <id> - Set YOUR PERSONAL channel for self-destructing media
-/mychannel - Show your personal channel settings
-/mychanneltest - Test your personal channel access
-
-**👤 YOUR ACCOUNT MANAGEMENT:**
-/mystatus - Check your login status and configuration
-/checkmissed - Check for missed self-destructing media (last 48h)
-/logout - Logout from your account
-
-**📚 GUIDANCE:**
-/savetips - Tips for saving self-destructing media
-
-**How it works:**
-1. You are logged in with your own account
-2. Set your personal channel with /setmychannel
-3. When you receive self-destructing media in your account
-4. It will be automatically saved to YOUR personal channel
-5. Works even when server was offline!
-6. Use /checkmissed to recover missed media
-
-**New Features:**
-• Offline media recovery
-• Queue system for missed media
-• 48-hour media scan with /checkmissed
-• Auto-check on bot restart
-            """
-        else:
-            user_help = """
-🤖 **Self-Destructing Media Downloader Bot**
-
-**User Commands:**
-/login - Login with your own Telegram account
-/savetips - Tips for saving self-destructing media
-
-**How it works:**
-1. Use /login to login with your own account
-2. Set your personal channel with /setmychannel
-3. When you receive self-destructing media in your account
-4. It will be automatically saved to YOUR personal channel
-5. Works even when server was offline!
-
-**Note:** Admin commands are not available for regular users.
-            """
-        await event.reply(user_help)
-        return
-    
-    # Show admin help - UPDATED WITH NEW COMMANDS
-        # Show admin help - UPDATED WITH NEW COMMANDS
-    help_text = """
-🤖 **Self-Destructing Media Downloader Bot**
-
-**📢 GLOBAL FORWARDING SETTINGS (Admin Only):**
-/globalforward enable/disable - Enable/disable forwarding to admin's global channel
-/globalforward status - Show current forwarding status
-
-**📢 BOT'S GLOBAL CHANNEL (Admin Only):**
-/setgchannel <id> - Set GLOBAL channel for BOT files
-/currentchannel - Show current bot channel config
-/testchannel - Test global channel access
-
-**👥 USER MANAGEMENT (Admin Only):**
-/users - Show all logged-in users
-/checkmissed <user_id> - Check missed media for specific user
-/checkmissed all - Check missed media for ALL users
-/checkmissed_all - Alternative command to check all users
-
-**📊 QUEUE MANAGEMENT (Admin Only):**
-/queue_stats - Show media queue statistics
-/process_queue - Process queued media items
-
-**📁 FILE MANAGEMENT (Admin Only):**
-/files - List all files in Media folder
-/check - Check for new files in media folder
-/download <path> - Download specific file
-/download_zip <folder> - Download folder as ZIP
-/delete <path> - Delete specific file
-/confirm_delete <path> - Confirm file deletion
-/all - Download all media files from media folder
-/zip - Create and send ZIP archive of Media folder
-
-**📋 LOG MANAGEMENT (Admin Only):**
-/logs [lines] [search] - View bot logs (default: 50 lines)
-/clearlogs - Clear log file (creates backup)
-/download_logs - Download entire log file
-/loglevel <level> - Change log level (DEBUG, INFO, WARNING, ERROR)
-
-**🖥️ SYSTEM COMMANDS (Admin Only):**
-/ping - Check bot status and network latency
-/status - Show download statistics
-/help - Show this help message
-
-**👤 USER ACCOUNT COMMANDS (Admin can also use):**
-/login - Login with your own Telegram account
-/logout - Logout from your account
-/mystatus - Check your login status
-/savetips - Tips for saving self-destructing media
-
-**📢 USER CHANNEL COMMANDS (User Self-Service):**
-/mychannel - Show user's personal channel
-/mychanneltest - Test user's personal channel
-/setmychannel <id> - Users set their OWN personal channel
-
-**✨ FEATURES:**
-• Auto-downloads self-destructing media from user accounts
-• Each user can have their own personal channel
-• Media sent to BOTH channels using different clients:
-  - User's channel: Sent using USER'S account (/setmychannel)
-  - Admin's channel: Sent using BOT account (/setgchannel)
-• Organized user folders (A - @username - ID)
-• Progress tracking for downloads
-• File management tools
-• User session login support
-• Log management and monitoring
-
-**🚀 NEW FEATURES:**
-• Offline media recovery system
-• Database queue for missed media
-• 48-hour media scan with /checkmissed
-• Queue statistics with /queue_stats
-• Manual queue processing with /process_queue
-• Separate channel commands:
-  - /setgchannel for bot's global channel (admin)
-  - /setmychannel for user's personal channel (users)
-• Enhanced /checkmissed command:
-  - Users: /checkmissed (check own media)
-  - Admin: /checkmissed <user_id> (check specific user)
-  - Admin: /checkmissed all (check all users)
-• User management commands:
-  - /users - List all logged-in users
-  - /checkmissed_all - Check all users
-• Global forwarding control:
-  - /globalforward enable - Enable forwarding to admin channel
-  - /globalforward disable - Disable forwarding to admin channel
-  - /globalforward status - Show current status
-• Auto-check system:
-  - Bot startup: Auto-check all users + process queue
-  - Every 5 minutes: Process queue
-  - Every 1 hour: Auto-check all users
-  - User login: Auto-check that user's missed media
-
-**🔧 ENHANCED /checkmissed COMMAND:**
-For Users:
-  • /checkmissed - Check your own missed media
-
-For Admin:
-  • /checkmissed <user_id> - Check specific user (e.g., /checkmissed 123456789)
-  • /checkmissed all - Check ALL logged-in users
-  • /checkmissed_all - Same as above
-
-**⚙️ GLOBAL FORWARDING SETTINGS:**
-• /globalforward enable - Enable forwarding to admin's global channel
-• /globalforward disable - Disable forwarding to admin's global channel
-• /globalforward status - Show current status
-• When DISABLED: Media goes ONLY to user's personal channel
-• When ENABLED: Media goes to BOTH channels (default)
-    """
-    await event.reply(help_text)
-
-# ===== GLOBAL FORWARDING COMMAND HANDLERS =====
-async def handle_globalforward(event, admin_id, state):
-    """Handle /globalforward command to enable/disable forwarding to admin's global channel"""
-    if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
-    
     args = event.text.split()
-    
-    if len(args) == 1:
-        # Show current status
-        current_status = state.get("global_forwarding_enabled", True)
-        status_text = "✅ ENABLED" if current_status else "❌ DISABLED"
-        
+    if len(args) < 2:
         await event.reply(
-            f"📢 **Global Forwarding Status:** {status_text}\n\n"
-            f"**Current Setting:**\n"
-            f"• Self-destruct media: {'Will be forwarded to admin channel' if current_status else 'Will NOT be forwarded to admin channel'}\n"
-            f"• /checkmissed media: {'Will be forwarded to admin channel' if current_status else 'Will NOT be forwarded to admin channel'}\n\n"
-            f"**Usage:**\n"
-            f"• `/globalforward enable` - Enable forwarding to admin's global channel\n"
-            f"• `/globalforward disable` - Disable forwarding to admin's global channel\n"
-            f"• `/globalforward status` - Show current status\n\n"
-            f"**What this controls:**\n"
-            f"• When ENABLED: Media is sent to BOTH user's personal channel AND admin's global channel\n"
-            f"• When DISABLED: Media is sent ONLY to user's personal channel\n\n"
-            f"**Note:** This does NOT affect local file saving. Files are always saved locally."
+            "❌ **Usage:** `/setmychannel <channel_id>`\n"
+            "**Example:** `/setmychannel -1001234567890`\n\n"
+            "Channel IDs must start with `-100`."
         )
         return
-    
-    action = args[1].lower()
-    
-    if action == "enable":
-        state["global_forwarding_enabled"] = True
-        await save_state(state)
         
-        await event.reply(
-            "✅ **Global Forwarding ENABLED**\n\n"
-            "**What this means:**\n"
-            "• Self-destructing media will be forwarded to admin's global channel\n"
-            "• /checkmissed media will be forwarded to admin's global channel\n"
-            "• Media is sent to BOTH channels (user's personal + admin's global)\n\n"
-            "**Channels involved:**\n"
-            "1. ✅ User's personal channel (set by user with /setmychannel)\n"
-            "2. ✅ Admin's global channel (set by admin with /setgchannel)\n"
-            "3. ✅ Local file storage (always saved)\n\n"
-            "**Status:** Forwarding to admin channel is now ACTIVE"
-        )
-        
-    elif action == "disable":
-        state["global_forwarding_enabled"] = False
-        await save_state(state)
-        
-        await event.reply(
-            "❌ **Global Forwarding DISABLED**\n\n"
-            "**What this means:**\n"
-            "• Self-destructing media will NOT be forwarded to admin's global channel\n"
-            "• /checkmissed media will NOT be forwarded to admin's global channel\n"
-            "• Media is sent ONLY to user's personal channel\n\n"
-            "**Channels involved:**\n"
-            "1. ✅ User's personal channel (set by user with /setmychannel)\n"
-            "2. ❌ Admin's global channel (NOT forwarded)\n"
-            "3. ✅ Local file storage (always saved)\n\n"
-            "**Status:** Forwarding to admin channel is now INACTIVE"
-        )
-        
-    elif action == "status":
-        current_status = state.get("global_forwarding_enabled", True)
-        status_text = "✅ ENABLED" if current_status else "❌ DISABLED"
-        
-        await event.reply(
-            f"📢 **Global Forwarding Status:** {status_text}\n\n"
-            f"**Effect on different operations:**\n"
-            f"• Self-destruct media: {'Forwarded to admin channel' if current_status else 'NOT forwarded to admin channel'}\n"
-            f"• /checkmissed: {'Forwarded to admin channel' if current_status else 'NOT forwarded to admin channel'}\n"
-            f"• Queued media: {'Forwarded to admin channel' if current_status else 'NOT forwarded to admin channel'}\n\n"
-            f"**Toggle with:**\n"
-            f"• `/globalforward enable`\n"
-            f"• `/globalforward disable`"
-        )
-        
-    else:
-        await event.reply(
-            "❌ **Invalid action!**\n\n"
-            "**Valid actions:**\n"
-            "• `enable` - Enable forwarding to admin channel\n"
-            "• `disable` - Disable forwarding to admin channel\n"
-            "• `status` - Show current status\n\n"
-            "**Examples:**\n"
-            "• `/globalforward enable`\n"
-            "• `/globalforward disable`\n"
-            "• `/globalforward status`"
-        )
-
-
-# ===== MODIFY USER_DOWNLOADER FUNCTION =====
-async def user_downloader(event, user_client, bot_client, all_media_dir, state):
-    """Download media from user's account - UPDATED with global forwarding setting"""
-    try:
-        # ✅ FIX: Pehle receiver (logged-in user) ka ID nikalo
-        try:
-            receiver_entity = await user_client.get_me()
-            receiver_id = receiver_entity.id
-            receiver_username = receiver_entity.username if receiver_entity.username else "NoUsername"
-        except:
-            receiver_id = "Unknown"
-            receiver_username = "Unknown"
-        
-        console.print(f"[cyan]Receiver (logged-in user): {receiver_username} (ID: {receiver_id})[/cyan]")
-        
-        # ✅ Ab sender (jo media bhej raha hai) ka info nikalo
-        try:
-            sender = await event.get_sender()
-            sender_username = sender.username if sender.username else "NoUsername"
-            sender_id = sender.id if sender.id else "Unknown"
-        except:
-            sender_username = "Unknown"
-            sender_id = "Unknown"
-
-        console.print(f"[cyan]Downloading from @{sender_username} (Sender ID: {sender_id}) to @{receiver_username} (Receiver ID: {receiver_id})[/cyan]")
-
-        # Find existing folder or create new one
-        user_folder_key = f"{sender_username}_{sender_id}"
-
-        if user_folder_key in state["user_folders"]:
-            user_folder_name = state["user_folders"][user_folder_key]
-        else:
-            counter = state["letter_counter"]
-            letter = string.ascii_uppercase[counter % 26]
-            user_folder_name = f"{counter:02d} - {letter} - @{sender_username} - {sender_id}"
-            state["user_folders"][user_folder_key] = user_folder_name
-            state["letter_counter"] += 1
-            await save_state(state)
-
-        user_folder_path = os.path.join(all_media_dir, user_folder_name)
-        os.makedirs(user_folder_path, exist_ok=True)
-
-        # Generate unique filename
-        timestamp = int(time.time())
-        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-
-        # Determine file type and extension
-        if event.photo:
-            file_ext = ".jpg"
-            media_type = "photo"
-        elif event.video:
-            file_ext = ".mp4"
-            media_type = "video"
-        elif event.document:
-            if hasattr(event.document, 'attributes') and event.document.attributes:
-                for attr in event.document.attributes:
-                    if hasattr(attr, 'file_name') and attr.file_name:
-                        file_ext = os.path.splitext(attr.file_name)[1]
-                        break
-                else:
-                    file_ext = ".bin"
-            else:
-                file_ext = ".bin"
-            media_type = "document"
-        elif event.audio:
-            file_ext = ".mp3"
-            media_type = "audio"
-        elif event.voice:
-            file_ext = ".ogg"
-            media_type = "voice"
-        elif event.video_note:
-            file_ext = ".mp4"
-            media_type = "video_note"
-        else:
-            file_ext = ".bin"
-            media_type = "unknown"
-
-        filename = f"{timestamp}_{random_str}{file_ext}"
-        file_path = os.path.join(user_folder_path, filename)
-
-        # Download with progress
-        file_size = event.file.size if event.file else 0
-        console.print(f"[cyan]File size: {file_size} bytes[/cyan]")
-
-        progress = RichDownloadProgress(filename, file_size) if file_size > 0 else None
-
-        await event.download_media(
-            file=file_path,
-            progress_callback=lambda c, t: progress.update(c) if progress else None
-        )
-
-        if progress:
-            progress.close()
-
-        # Verify save
-        if not os.path.exists(file_path):
-            console.print("[red]ERROR: File was not saved[/red]")
-            return
-
-        actual_size = os.path.getsize(file_path)
-        file_size_mb = actual_size / (1024 * 1024) if actual_size > 0 else 0
-
-        console.print(
-            f"[green]✓ Downloaded {media_type} ({file_size_mb:.2f} MB) from @{sender_username} → {filename}[/green]"
-        )
-        logger.info(
-            f"Downloaded {media_type} ({file_size_mb:.2f} MB) from @{sender_username} to @{receiver_username} → {filename}"
-        )
-
-        # ✅ Get global forwarding setting
-        global_forwarding_enabled = state.get("global_forwarding_enabled", True)
-        console.print(f"[cyan]Global forwarding to admin channel: {'ENABLED' if global_forwarding_enabled else 'DISABLED'}[/cyan]")
-        
-        # ✅ IMPORTANT FIX: Ab RECEIVER ka ID use karo user session dhoondne ke liye
-        # Send to BOTH channels if configured
-        # 1. First check if RECEIVER (logged-in user) has personal channel
-        user_session = state.get("user_sessions", {}).get(str(receiver_id))  # ✅ CHANGE HERE
-        
-        user_channel_id = None
-        if user_session:
-            # Use RECEIVER's personal channel if set
-            user_channel_id = user_session.get("channel_id")
-            console.print(f"[cyan]RECEIVER's personal channel ID: {user_channel_id}[/cyan]")
-        else:
-            console.print(f"[yellow]No user session found for receiver ID: {receiver_id}[/yellow]")
-            # Debug: Print all user sessions
-            console.print(f"[yellow]Available user sessions: {list(state.get('user_sessions', {}).keys())}[/yellow]")
-        
-        # 2. Get admin's global channel
-        admin_channel_id = getattr(bot_client, "channel_id", None)
-        console.print(f"[cyan]Admin global channel ID: {admin_channel_id}[/cyan]")
-        
-        # Track sending status
-        sent_to_user_channel = False
-        sent_to_admin_channel = False
-        
-        # Send to RECEIVER's personal channel FIRST (using RECEIVER'S client)
-        if user_channel_id:
-            try:
-                success = await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
-                if success:
-                    console.print(f"[green]✓ File sent to RECEIVER's personal channel {user_channel_id}[/green]")
-                    sent_to_user_channel = True
-                else:
-                    console.print(f"[red]Failed to send to RECEIVER's personal channel {user_channel_id}[/red]")
-                    logger.warning(f"File saved but failed to send to RECEIVER's channel: {filename}")
-            except Exception as e:
-                console.print(f"[red]RECEIVER channel upload error: {e}[/red]")
-                logger.error(f"RECEIVER channel upload error: {e}")
-        
-        # Send to admin's global channel SECOND (using BOT client) - CHECK GLOBAL FORWARDING SETTING
-        if admin_channel_id and global_forwarding_enabled:
-            # Check if admin channel is different from RECEIVER's channel
-            if admin_channel_id != user_channel_id:
-                try:
-                    success = await send_to_admin_channel(bot_client, file_path, sender_username, admin_channel_id)
-                    if success:
-                        console.print(f"[green]✓ File sent to admin's global channel {admin_channel_id}[/green]")
-                        sent_to_admin_channel = True
-                    else:
-                        console.print(f"[red]Failed to send to admin's global channel {admin_channel_id}[/red]")
-                        logger.warning(f"File saved but failed to send to admin channel: {filename}")
-                except Exception as e:
-                    console.print(f"[red]Admin channel upload error: {e}[/red]")
-                    logger.error(f"Admin channel upload error: {e}")
-            else:
-                console.print("[yellow]Admin channel and RECEIVER channel are same, skipping duplicate send[/yellow]")
-                sent_to_admin_channel = True  # Already sent via RECEIVER channel
-        elif admin_channel_id and not global_forwarding_enabled:
-            console.print("[yellow]Global forwarding to admin channel is DISABLED, skipping admin channel[/yellow]")
-        
-        # Send summary
-        if sent_to_user_channel or sent_to_admin_channel:
-            channels_sent = []
-            if sent_to_user_channel:
-                channels_sent.append("RECEIVER's personal channel")
-            if sent_to_admin_channel:
-                channels_sent.append("admin's global channel")
-                        
-            console.print(f"[green]✓ File sent to: {', '.join(channels_sent)}[/green]")
-            
-            # ✅ Also notify the receiver about the save
-            try:
-                global BOT_CLIENT
-                if BOT_CLIENT:
-                    channel_names = []
-                    if sent_to_user_channel:
-                        channel_names.append("your personal channel")
-                    if sent_to_admin_channel:
-                        channel_names.append("admin's global channel")
-                    
-            except Exception as e:
-                console.print(f"[yellow]Could not notify user: {e}[/yellow]")
-        else:
-            console.print("[yellow]No channel configured, file saved locally only[/yellow]")
-
-    except Exception as e:
-        console.print(f"[red]Error in user_downloader: {e}[/red]")
-        logger.error(f"User downloader error: {e}")
-
-
-# ===== MODIFY USER_DOWNLOADER_QUEUE FUNCTION =====
-async def user_downloader_queue(user_client, file_path, sender_username, user_id, state, media_type, ttl):
-    """Process downloaded media from queue - UPDATED with global forwarding setting"""
-    try:
-        # ✅ Get global forwarding setting
-        global_forwarding_enabled = state.get("global_forwarding_enabled", True)
-        
-        # Get user's channel from state
-        user_session = state.get("user_sessions", {}).get(str(user_id))
-        user_channel_id = user_session.get("channel_id") if user_session else None
-        
-        # Send to user's channel if set
-        if user_channel_id:
-            try:
-                success = await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
-                if success:
-                    console.print(f"[green]✓ Media sent to user's channel {user_channel_id}[/green]")
-            except Exception as e:
-                console.print(f"[red]Error sending to user channel: {e}[/red]")
-        
-        # Also send to admin channel if available AND global forwarding is enabled
-        global BOT_CLIENT
-        if BOT_CLIENT and hasattr(BOT_CLIENT, 'channel_id') and BOT_CLIENT.channel_id and global_forwarding_enabled:
-            try:
-                success = await send_to_admin_channel(BOT_CLIENT, file_path, sender_username, BOT_CLIENT.channel_id)
-                if success:
-                    console.print(f"[green]✓ Media sent to admin's channel {BOT_CLIENT.channel_id}[/green]")
-            except Exception as e:
-                console.print(f"[red]Error sending to admin channel: {e}[/red]")
-        elif BOT_CLIENT and hasattr(BOT_CLIENT, 'channel_id') and BOT_CLIENT.channel_id and not global_forwarding_enabled:
-            console.print("[yellow]Global forwarding to admin channel is DISABLED, skipping admin channel for queued media[/yellow]")
-        
-        # Organize file
-        final_path = await organize_and_save_file(file_path, sender_username, user_id, state, media_type)
-        
-        console.print(f"[green]✓ Successfully processed queued media (TTL: {ttl}s)[/green]")
-        return True
-        
-    except Exception as e:
-        console.print(f"[red]Error processing media file from queue: {e}[/red]")
-        return False
-
-
-async def handle_status(event, admin_id, state):
-    """Show download statistics"""
-    if not await is_admin(event, admin_id):
+    raw_id = args[1].strip()
+    if not raw_id.startswith('-100'):
+        await event.reply("❌ Invalid format! Channel IDs must be negative numbers starting with `-100`.\nExample: `-1001234567890`")
         return
-    
-    count_photos = count_videos = count_docs = 0
-    total_size = 0
-    
-    for root, dirs, files in os.walk(all_media_dir):
-        for file in files:
-            filepath = os.path.join(root, file)
-            try:
-                size = os.path.getsize(filepath)
-                total_size += size
-            except:
-                continue
-            
-            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
-                count_photos += 1
-            elif file.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm')):
-                count_videos += 1
-            else:
-                count_docs += 1
-    
-    total_mb = total_size / (1024 * 1024) if total_size > 0 else 0
-    
-    # Check global channel status
-    channel_id = getattr(event.client, 'channel_id', None)
-    channel_status = "✅ Configured" if channel_id else "❌ Not configured"
-    
-    # Count logged-in users and users with personal channels
-    logged_in_users = len(state.get("user_sessions", {}))
-    users_with_channels = 0
-    for user_id, user_data in state.get("user_sessions", {}).items():
-        if user_data.get("channel_id"):
-            users_with_channels += 1
-    
-    # Get log file info
-    log_size = 0
-    if os.path.exists(LOG_FILE):
-        log_size = os.path.getsize(LOG_FILE)
-        log_size_str = f"{log_size/1024:.1f} KB" if log_size < 1024*1024 else f"{log_size/(1024*1024):.2f} MB"
-    else:
-        log_size_str = "No log file"
-    
-    # Get queue stats with await
+        
     try:
-        queue_stats = await MEDIA_QUEUE.get_queue_stats()
-        pending_count = queue_stats.get('pending_count', 0)
-        processed_count = queue_stats.get('total_processed', 0)
+        channel_id = int(raw_id)
+    except ValueError:
+        await event.reply("❌ Channel ID must be a valid number.")
+        return
+        
+    success = await update_user_channel_id(user_id, channel_id, state)
+    if success:
+        await event.reply(
+            f"✅ **Personal Channel configured successfully!**\n\n"
+            f"• Channel ID: `{channel_id}`\n"
+            f"• Test access with: `/mychanneltest`"
+        )
+    else:
+        await event.reply("❌ Failed to update channel configuration.")
+
+
+async def handle_mychannel(event: Any, admin_id: Optional[int], state: dict):
+    """Handle /mychannel command."""
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    if not user_session:
+        await event.reply("❌ You are not logged in. Use `/login` first.")
+        return
+        
+    channel_id = user_session.get("channel_id")
+    if channel_id:
+        await event.reply(
+            f"📢 **Your Personal Channel:**\n\n"
+            f"• Channel ID: `{channel_id}`\n"
+            f"• Test with: `/mychanneltest`\n"
+            f"• Change with: `/setmychannel <id>`"
+        )
+    else:
+        await event.reply("ℹ️ You have not configured a personal channel yet. Use `/setmychannel -100xxxxxxxxxx`.")
+
+
+async def handle_mychanneltest(event: Any, admin_id: Optional[int], state: dict):
+    """Test user's personal channel access using their connected user client."""
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    if not user_session:
+        await event.reply("❌ You are not logged in. Use `/login` first.")
+        return
+        
+    channel_id = user_session.get("channel_id")
+    if not channel_id:
+        await event.reply("❌ No personal channel configured. Use `/setmychannel` first.")
+        return
+        
+    await event.reply(f"🔄 Testing personal channel access (`{channel_id}`)...")
+    
+    global ACTIVE_USER_CLIENTS
+    user_client = ACTIVE_USER_CLIENTS.get(str(user_id))
+    
+    if not user_client or not user_client.is_connected():
+        await event.reply("❌ User client is not currently connected. Try `/login` again.")
+        return
+        
+    try:
+        # Test posting using USER's client (which is what handles personal media delivery)
+        test_msg = f"✅ Personal Channel Test Successful!\nTime: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+        await user_client.send_message(channel_id, test_msg)
+        await event.reply(f"✅ **Channel Test Passed!**\nTest message was successfully posted to `{channel_id}` via your account.")
+    except ChannelPrivateError:
+        await event.reply("❌ Failed: The channel is private and your user account does not have access.")
+    except ChatAdminRequiredError:
+        await event.reply("❌ Failed: Your user account lacks permission to post messages in this channel.")
+    except ValueError as e:
+        await event.reply(f"❌ Failed: Could not resolve channel ID `{channel_id}` ({e}). Ensure the ID starts with `-100`.")
     except Exception as e:
-        console.print(f"[red]Error getting queue stats: {e}[/red]")
-        pending_count = 0
-        processed_count = 0
+        await event.reply(f"❌ Channel test failed: {e}")
+
+
+async def handle_checkmissed(event: Any, admin_id: Optional[int], state: dict):
+    """Handle /checkmissed for regular user."""
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    if not user_session:
+        await event.reply("❌ You are not logged in. Use `/login` first.")
+        return
+        
+    await event.reply("🔄 Scanning private chats for missed self-destructing media (last 48 hours)...")
+    
+    global ACTIVE_USER_CLIENTS
+    user_client = ACTIVE_USER_CLIENTS.get(str(user_id))
+    if not user_client:
+        await event.reply("❌ User client is not active. Please `/login`.")
+        return
+        
+    found = await check_missed_media(user_id, user_client, state)
+    if found > 0:
+        await event.reply(
+            f"✅ **Found {found} missed self-destructing media items!**\n"
+            "They have been queued for processing.\n"
+            "Use `/queue_stats` to see queue status or `/process_queue` to process immediately."
+        )
+    else:
+        await event.reply("📭 No missed self-destructing media found in the last 48 hours.")
+
+
+async def handle_queue_stats(event: Any, admin_id: Optional[int], state: dict):
+    """Show personal queue statistics."""
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    stats = await MEDIA_QUEUE.get_queue_stats() if MEDIA_QUEUE else {}
+    pending = stats.get('pending_by_user', {}).get(str(user_id), 0)
     
     await event.reply(
-        f"📊 **Download Statistics**\n"
-        f"• Photos: {count_photos}\n"
-        f"• Videos: {count_videos}\n"
-        f"• Documents: {count_docs}\n"
-        f"• Total Size: {total_mb:.2f} MB\n"
-        f"• Users: {len(state['user_folders'])}\n"
-        f"• Logged-in Users: {logged_in_users}\n"
-        f"• Users with Personal Channels: {users_with_channels}\n"
-        f"• Global Channel: {channel_status}\n"
-        f"• Log File Size: {log_size_str}\n"
-        f"• Media Queue: {pending_count} pending, {processed_count} processed\n"
-        f"• Offline Recovery: ✅ Enabled\n"
-        f"• Media Distribution: User's Channel + Admin's Channel\n"
-        f"• Login Type: Bot Token"
+        f"📊 **Your Media Queue:**\n\n"
+        f"• Pending Items: {pending}\n"
+        f"• Total Processed (All Users): {stats.get('total_processed', 0)}\n\n"
+        f"Use `/process_queue` to process your queue immediately."
     )
 
-async def resolve_entity_safely(client, chat_id, username=None):
-    """Safely resolve entity using multiple methods"""
-    try:
-        # Method 1: Try direct entity lookup
-        try:
-            entity = await client.get_entity(chat_id)
-            return entity
-        except ValueError as e:
-            if "Could not find the input entity" not in str(e):
-                raise
+
+async def handle_process_queue(event: Any, admin_id: Optional[int], state: dict):
+    """Process personal queue items."""
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    user_session = state.get("user_sessions", {}).get(str(user_id))
+    if not user_session:
+        await event.reply("❌ You are not logged in. Use `/login` first.")
+        return
         
-        # Method 2: Try by username
-        if username:
-            try:
-                entity = await client.get_entity(username)
-                return entity
-            except:
-                pass
-        
-        # Method 3: Get from dialogs
-        try:
-            dialogs = await client.get_dialogs(limit=50)
-            for dialog in dialogs:
-                if dialog.entity.id == chat_id:
-                    return dialog.entity
-        except:
-            pass
-        
-        # Method 4: Try input peer
-        try:
-            from telethon.tl.types import InputPeerUser
-            
-            # Get access hash from dialogs
-            dialogs = await client.get_dialogs(limit=50)
-            for dialog in dialogs:
-                if hasattr(dialog.entity, 'access_hash') and dialog.entity.id == chat_id:
-                    return InputPeerUser(user_id=chat_id, access_hash=dialog.entity.access_hash)
-        except:
-            pass
-        
-        # Last resort: return as is
-        return chat_id
-        
-    except Exception as e:
-        console.print(f"[red]Failed to resolve entity: {e}[/red]")
-        return None
-        
-async def handle_savetips(event):
-    """Show tips for saving self-destructing media"""
-    tips = """
-⚠️ **How to Save Self-Destructing Media:**
+    await event.reply("🔄 Processing your pending media queue...")
+    processed, failed = await process_queue_items(user_id=user_id, limit=10, state=state)
+    await event.reply(f"✅ **Queue processing completed:** {processed} processed, {failed} failed.")
 
-**Using Your Own Account (Recommended)**
-1. **Login with your own account:**
-   - Use /login command in bot
-   - Follow the login steps
-   - Your account will be connected
 
-2. **Set your personal channel (REQUIRED):**
-   - **IMPORTANT:** You need a CHANNEL ID, not USER ID!
-   - Channel IDs start with `-100` (e.g., -1001234567890)
-   - **How to get Channel ID:**
-     1. Add @getidsbot to your channel
-     2. Send any message in the channel
-     3. Bot will reply with your Channel ID
-     4. Copy the ID (looks like -1001234567890)
-   - Use `/setmychannel -1001234567890` to set it
-   - Test with `/mychanneltest`
-
-3. **Receive self-destructing media:**
-   - When someone sends you self-destructing media
-   - Bot will automatically detect and save it
-   - File will be sent to TWO places:
-     1. ✅ YOUR personal channel (using your account)
-     2. ✅ Bot's global channel (using bot account)
-
-4. **Check missed media (NEW!):**
-   - If server was offline, use `/checkmissed`
-   - This scans last 48 hours of chat for missed media
-   - Missed media gets queued for processing
-   - Admin can process queue with `/process_queue`
-
-**DUAL CHANNEL SYSTEM:**
-✅ **Your Personal Channel:** `/setmychannel`
-   - Your media in YOUR channel
-   - Using YOUR account
-
-✅ **Bot's Global Channel:** Admin sets with `/setgchannel`
-   - Backup/archive of ALL users' media
-   - Using BOT account
-
-**Common Mistakes to Avoid:**
-❌ **DO NOT** use your user ID (positive number like 5251410210)
-✅ **DO** use channel ID (negative number starting with -100)
-
-**For best results:**
-1. Use /login to connect your account
-2. Use /setmychannel with a proper channel ID (-100...)
-3. Test with /mychanneltest
-4. Receive self-destructing media in your account
-5. Use /checkmissed if you suspect missed media
-    """
-    
+async def handle_savetips(event: Any):
+    """Display tips for saving self-destructing media."""
+    tips = (
+        "💡 **Self-Destructing Media Tips & Guidelines:**\n\n"
+        "1. **Telegram Limitation:** Regular Telegram bots cannot directly access TTL media. "
+        "This tool uses an authorized user session (`/login`) to receive and capture media.\n"
+        "2. **Personal Channel:** Configure your personal channel with `/setmychannel -100xxxxxxxxxx`. "
+        "Ensure channel IDs start with `-100`.\n"
+        "3. **Offline Recovery:** If the bot was offline when someone sent TTL media, use `/checkmissed` to scan up to 48 hours back.\n"
+        "4. **Security:** Your API credentials and session strings are encrypted using Fernet (AES-128-CBC) and never shared."
+    )
     await event.reply(tips)
 
 
-# Log Management Commands
-async def handle_logs(event, admin_id, state):
-    """View bot logs"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        if not os.path.exists(LOG_FILE):
-            await event.reply("📭 No log file found.")
-            return
-        
-        # Parse command arguments
-        args = event.text.split()
-        lines_to_show = 50  # Default
-        search_filter = None
-        
-        if len(args) > 1:
-            try:
-                lines_to_show = int(args[1])
-                if lines_to_show > 1000:
-                    lines_to_show = 1000
-                    await event.reply("⚠️ Limiting to 1000 lines maximum.")
-            except ValueError:
-                # First argument might be search term
-                search_filter = args[1]
-                if len(args) > 2:
-                    try:
-                        lines_to_show = int(args[2])
-                    except:
-                        pass
-        
-        # If we have a search term in position 2 or 3
-        if len(args) > 2 and search_filter is None:
-            search_filter = args[2]
-        
-        # Read log file
-        with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            all_lines = f.readlines()
-        
-        if not all_lines:
-            await event.reply("📭 Log file is empty.")
-            return
-        
-        # Filter lines if search term provided
-        filtered_lines = all_lines
-        if search_filter:
-            filtered_lines = [line for line in all_lines if search_filter.lower() in line.lower()]
-        
-        if not filtered_lines:
-            await event.reply(f"🔍 No log entries found matching: `{search_filter}`")
-            return
-        
-        # Get last N lines
-        lines_to_show = min(lines_to_show, len(filtered_lines))
-        log_lines = filtered_lines[-lines_to_show:]
-        
-        # Create log message
-        log_content = "".join(log_lines)
-        
-        # Get log file stats
-        file_size = os.path.getsize(LOG_FILE)
-        file_size_str = f"{file_size/1024:.1f} KB" if file_size < 1024*1024 else f"{file_size/(1024*1024):.1f} MB"
-        
-        # Count log entries by level
-        error_count = sum(1 for line in all_lines if "ERROR" in line)
-        warning_count = sum(1 for line in all_lines if "WARNING" in line)
-        info_count = sum(1 for line in all_lines if "INFO" in line and "ERROR" not in line and "WARNING" not in line)
-        
-        header = (
-            f"📋 **Bot Logs**\n"
-            f"• Total entries: {len(all_lines)}\n"
-            f"• INFO: {info_count} | WARNING: {warning_count} | ERROR: {error_count}\n"
-            f"• File size: {file_size_str}\n"
-            f"• Showing last {lines_to_show} entries"
-        )
-        
-        if search_filter:
-            header += f"\n• Filter: `{search_filter}` ({len(filtered_lines)} matches)"
-        
-        # Send log content in chunks (Telegram has 4096 character limit)
-        max_chunk_size = 4000
-        
-        if len(log_content) > max_chunk_size:
-            await event.reply(header, parse_mode='markdown')
-            
-            # Split log content into chunks
-            chunks = []
-            current_chunk = ""
-            
-            for line in log_lines:
-                if len(current_chunk) + len(line) > max_chunk_size:
-                    chunks.append(current_chunk)
-                    current_chunk = line
-                else:
-                    current_chunk += line
-            
-            if current_chunk:
-                chunks.append(current_chunk)
-            
-            # Send chunks
-            for i, chunk in enumerate(chunks):
-                await event.reply(f"```\n{chunk}\n```", parse_mode='markdown')
-                await asyncio.sleep(0.5)  # Avoid rate limiting
-        else:
-            await event.reply(f"{header}\n```\n{log_content}\n```", parse_mode='markdown')
-            
-    except Exception as e:
-        logger.error(f"Error in /logs command: {str(e)}")
-        await event.reply(f"❌ Error reading logs: {str(e)}")
+# --- ADMIN COMMANDS ---
 
-
-async def handle_clearlogs(event, admin_id, state):
-    """Clear log file with backup"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        if not os.path.exists(LOG_FILE):
-            await event.reply("📭 No log file found to clear.")
-            return
-        
-        # Create backup
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        backup_file = f"bot_log_backup_{timestamp}.log"
-        
-        # Copy log file to backup
-        import shutil
-        shutil.copy2(LOG_FILE, backup_file)
-        
-        # Clear the log file
-        with open(LOG_FILE, 'w', encoding='utf-8') as f:
-            f.write(f"Log cleared at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        
-        # Get backup size
-        backup_size = os.path.getsize(backup_file)
-        backup_size_str = f"{backup_size/1024:.1f} KB" if backup_size < 1024*1024 else f"{backup_size/(1024*1024):.1f} MB"
-        
-        await event.reply(
-            f"✅ **Log file cleared successfully!**\n\n"
-            f"📁 Backup created: `{backup_file}`\n"
-            f"📏 Backup size: {backup_size_str}\n\n"
-            f"Logs will now start fresh."
-        )
-        
-        logger.info("Log file cleared by admin")
-        
-    except Exception as e:
-        logger.error(f"Error in /clearlogs command: {str(e)}")
-        await event.reply(f"❌ Error clearing logs: {str(e)}")
-
-
-async def handle_download_logs(event, admin_id, state):
-    """Download entire log file"""
-    if not await is_admin(event, admin_id):
-        return
-    
-    try:
-        if not os.path.exists(LOG_FILE):
-            await event.reply("📭 No log file found.")
-            return
-        
-        file_size = os.path.getsize(LOG_FILE)
-        file_size_mb = file_size / (1024 * 1024)
-        
-        if file_size_mb > 50:
-            await event.reply(
-                f"⚠️ Log file is too large ({file_size_mb:.1f} MB).\n"
-                f"Use /logs to view specific sections or /clearlogs to clear it."
-            )
-            return
-        
-        await event.reply(f"📤 Sending log file ({file_size_mb:.2f} MB)...")
-        
-        # Count log entries by level
-        with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            all_lines = f.readlines()
-        
-        error_count = sum(1 for line in all_lines if "ERROR" in line)
-        warning_count = sum(1 for line in all_lines if "WARNING" in line)
-        info_count = sum(1 for line in all_lines if "INFO" in line and "ERROR" not in line and "WARNING" not in line)
-        
-        caption = (
-            f"📋 Bot Log File\n"
-            f"📁 File: {LOG_FILE}\n"
-            f"📏 Size: {file_size_mb:.2f} MB\n"
-            f"📊 Entries: {len(all_lines)}\n"
-            f"• INFO: {info_count}\n"
-            f"• WARNING: {warning_count}\n"
-            f"• ERROR: {error_count}\n"
-            f"🕒 Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        await event.client.send_file(
-            event.chat_id,
-            LOG_FILE,
-            caption=caption
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in /download_logs command: {str(e)}")
-        await event.reply(f"❌ Error downloading logs: {str(e)}")
-
-# ===== NEW ADMIN MANAGEMENT COMMANDS =====
-async def handle_users(event, admin_id, state):
-    """Show all logged-in users (Admin only)"""
+async def handle_setgchannel(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Set global bot channel."""
     if not await is_admin(event, admin_id):
         await event.reply("❌ You are not authorized to use this command.")
         return
-    
-    user_sessions = state.get("user_sessions", {})
-    
-    if not user_sessions:
-        await event.reply("📭 No users are currently logged in.")
-        return
-    
-    message = "👥 **Logged-in Users:**\n\n"
-    
-    for user_id_str, user_data in user_sessions.items():
-        user_id = int(user_id_str)
-        username = user_data.get('username', 'No username')
-        first_name = user_data.get('first_name', 'Unknown')
-        phone = user_data.get('phone', 'No phone')
-        has_channel = "✅" if user_data.get('channel_id') else "❌"
-        login_time = user_data.get('login_time', time.time())
         
-        # Calculate login duration
-        duration = time.time() - login_time
-        hours = int(duration // 3600)
-        minutes = int((duration % 3600) // 60)
-        
-        # Get queue stats for this user
-        try:
-            queue_stats = await MEDIA_QUEUE.get_queue_stats()
-            pending_count = queue_stats.get('pending_by_user', {}).get(user_id_str, 0)
-        except:
-            pending_count = 0
-        
-        message += (
-            f"**User ID:** `{user_id}`\n"
-            f"• Name: {first_name}\n"
-            f"• Username: @{username}\n"
-            f"• Phone: {phone}\n"
-            f"• Personal Channel: {has_channel}\n"
-            f"• Pending Media: {pending_count}\n"
-            f"• Logged in: {hours}h {minutes}m\n"
-            f"• Check missed: `/checkmissed {user_id}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        )
-    
-    message += f"**Total Users:** {len(user_sessions)}\n"
-    message += "**Commands:**\n• Check all: `/checkmissed_all`\n• Check specific: `/checkmissed <user_id>`"
-    
-    # Split if too long
-    if len(message) > 4000:
-        chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-        for i, chunk in enumerate(chunks):
-            await event.reply(f"**Users List (Part {i+1}/{len(chunks)}):**\n{chunk}", parse_mode='markdown')
-    else:
-        await event.reply(message, parse_mode='markdown')
-
-
-async def handle_checkmissed_all(event, admin_id, state):
-    """Admin: Check missed media for ALL logged-in users"""
-    if not await is_admin(event, admin_id):
-        await event.reply("❌ You are not authorized to use this command.")
-        return
-    
-    user_sessions = state.get("user_sessions", {})
-    
-    if not user_sessions:
-        await event.reply("📭 No users are currently logged in.")
-        return
-    
-    await event.reply(f"🔄 Checking missed media for ALL {len(user_sessions)} users... This may take a while.")
-    
-    total_found_all = 0
-    results = []
-    
-    for user_id_str, user_data in user_sessions.items():
-        user_id = int(user_id_str)
-        username = user_data.get('username', f'User {user_id}')
-        
-        try:
-            # Load user client
-            user_session_file = get_user_session_file(user_id)
-            if not os.path.exists(user_session_file):
-                results.append(f"❌ {username}: Session file not found")
-                continue
-            
-            async with aiofiles.open(user_session_file, mode="r") as f:
-                session_string = await f.read()
-            
-            session = StringSession(session_string)
-            user_client = TelegramClient(session, user_data["api_id"], user_data["api_hash"])
-            
-            await user_client.connect()
-            
-            if await user_client.is_user_authorized():
-                console.print(f"[cyan]Checking missed media for user {user_id} (@{username})[/cyan]")
-                
-                found_count = await check_missed_media(user_id, user_client, state)
-                total_found_all += found_count
-                
-                results.append(f"✅ {username}: Found {found_count} missed media")
-                
-                await user_client.disconnect()
-                await asyncio.sleep(2)  # Delay between users
-            else:
-                results.append(f"❌ {username}: Not authorized")
-                await user_client.disconnect()
-                
-        except Exception as e:
-            results.append(f"❌ {username}: Error - {str(e)[:50]}")
-            console.print(f"[red]Error checking user {user_id}: {e}[/red]")
-    
-    # Send summary
-    summary = (
-        f"📊 **Missed Media Check - COMPLETED**\n\n"
-        f"**Total Users Checked:** {len(user_sessions)}\n"
-        f"**Total Missed Media Found:** {total_found_all}\n\n"
-        f"**Results:**\n" + "\n".join(results) + "\n\n"
-        f"**Queue Status:** Use `/queue_stats` to see pending items.\n"
-        f"**Process Queue:** Use `/process_queue` to process them."
-    )
-    
-    # Split if too long
-    if len(summary) > 4000:
-        chunks = [summary[i:i+4000] for i in range(0, len(summary), 4000)]
-        for i, chunk in enumerate(chunks):
-            await event.reply(f"**Results (Part {i+1}/{len(chunks)}):**\n{chunk}", parse_mode='markdown')
-    else:
-        await event.reply(summary, parse_mode='markdown')
-
-
-async def handle_checkmissed_enhanced(event, admin_id, state):
-    """Enhanced checkmissed command for both users and admin"""
-    
     args = event.text.split()
-    
-    # If user is not admin and trying to check other user
-    if not await is_admin(event, admin_id) and len(args) > 1:
-        await event.reply("❌ You can only check your own missed media.")
+    if len(args) < 2:
+        await event.reply("❌ Usage: `/setgchannel <channel_id>`\nExample: `/setgchannel -1001234567890`")
         return
-    
-    # USER: Check own missed media (no arguments or just /checkmissed)
-    if len(args) == 1 or (len(args) == 2 and args[1].isdigit() and not await is_admin(event, admin_id)):
-        await handle_checkmissed(event, admin_id, state)
+        
+    raw_id = args[1].strip()
+    if not raw_id.startswith('-100'):
+        await event.reply("❌ Channel ID must start with `-100`.")
         return
+        
+    try:
+        channel_id = int(raw_id)
+    except ValueError:
+        await event.reply("❌ Invalid integer channel ID.")
+        return
+        
+    await update_channel_id(str(channel_id))
+    if hasattr(event.client, 'channel_id'):
+        event.client.channel_id = channel_id
+    if BOT_CLIENT:
+        BOT_CLIENT.channel_id = channel_id
+        
+    await event.reply(f"✅ **Global Channel set to:** `{channel_id}`")
+
+
+async def handle_currentchannel(event: Any, admin_id: Optional[int], state: dict):
+    """Admin/User: Display global channel configuration."""
+    if not await is_admin(event, admin_id):
+        await handle_mychannel(event, admin_id, state)
+        return
+        
+    ch_id = getattr(event.client, 'channel_id', None) or (BOT_CONFIG.get('channel_id') if BOT_CONFIG else None)
+    if ch_id:
+        await event.reply(f"📢 **Bot Global Channel:** `{ch_id}`")
+    else:
+        await event.reply("ℹ️ No global channel configured. Use `/setgchannel <channel_id>`.")
+
+
+async def handle_testchannel(event: Any, admin_id: Optional[int]):
+    """Admin: Test global channel posting access."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+        
+    ch_id = getattr(event.client, 'channel_id', None)
+    if not ch_id:
+        await event.reply("❌ No global channel configured. Use `/setgchannel`.")
+        return
+        
+    try:
+        test_msg = f"✅ Global Channel Test Successful!\nTime: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+        await event.client.send_message(ch_id, test_msg)
+        await event.reply(f"✅ Test message successfully sent to global channel `{ch_id}`.")
+    except Exception as e:
+        await event.reply(f"❌ Global channel test failed: {e}")
+
+
+async def handle_globalforward(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Toggle forwarding to global channel."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+        
+    args = event.text.split()
+    if len(args) == 1 or args[1].lower() == "status":
+        curr = state.get("global_forwarding_enabled", True)
+        await event.reply(f"📢 **Global Forwarding Status:** {'✅ ENABLED' if curr else '❌ DISABLED'}\n\nToggle with `/globalforward enable` or `/globalforward disable`.")
+        return
+        
+    action = args[1].lower()
+    if action == "enable":
+        state["global_forwarding_enabled"] = True
+        await save_state(state)
+        await event.reply("✅ **Global Forwarding ENABLED.** Media will be copied to admin's global channel.")
+    elif action == "disable":
+        state["global_forwarding_enabled"] = False
+        await save_state(state)
+        await event.reply("❌ **Global Forwarding DISABLED.** Media will go only to personal user channels.")
+    else:
+        await event.reply("❌ Usage: `/globalforward <enable|disable|status>`")
+
+
+# --- ADMIN FILE MANAGEMENT (HARDENED AGAINST PATH TRAVERSAL) ---
+
+async def handle_files(event: Any, admin_id: Optional[int]):
+    """Admin: List files within the Media folder safely."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+        
+    total_files = 0
+    total_size = 0
+    file_list = []
     
-    # ADMIN: Check specific user
-    if len(args) == 2:
-        if args[1].lower() == 'all':
-            await handle_checkmissed_all(event, admin_id, state)
-            return
-        elif args[1].isdigit():
-            user_id_to_check = int(args[1])
-            await handle_checkmissed_user(event, admin_id, state, user_id_to_check)
-            return
+    for root, dirs, files in os.walk(MEDIA_DIR):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                sz = os.path.getsize(p)
+                total_size += sz
+                total_files += 1
+                rel = os.path.relpath(p, MEDIA_DIR)
+                if len(file_list) < 30:
+                    file_list.append(f"• `{rel}` ({sz / (1024*1024):.2f} MB)")
+            except Exception:
+                pass
+                
+    size_mb = total_size / (1024 * 1024)
+    msg = f"📁 **Media Directory Summary:**\n• Total Files: {total_files}\n• Total Size: {size_mb:.2f} MB\n\n"
+    if file_list:
+        msg += "**Recent Files:**\n" + "\n".join(file_list)
+        if total_files > 30:
+            msg += f"\n\n_...and {total_files - 30} more files._"
+    else:
+        msg += "_No files found in Media directory._"
+        
+    await event.reply(msg, parse_mode='markdown')
+
+
+async def handle_check(event: Any, admin_id: Optional[int]):
+    """Admin: Check for files modified in the last 24 hours."""
+    if not await is_admin(event, admin_id):
+        return
+    cutoff = time.time() - (24 * 3600)
+    recent = []
+    for root, dirs, files in os.walk(MEDIA_DIR):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                mtime = os.path.getmtime(p)
+                if mtime > cutoff:
+                    sz = os.path.getsize(p)
+                    recent.append((os.path.relpath(p, MEDIA_DIR), sz, mtime))
+            except Exception:
+                pass
+                
+    recent.sort(key=lambda x: x[2], reverse=True)
+    if not recent:
+        await event.reply("📭 No media files modified in the last 24 hours.")
+        return
+        
+    lines = [f"• `{r[0]}` ({r[1]/(1024*1024):.2f} MB)" for r in recent[:25]]
+    await event.reply(f"📁 **Files in Last 24 Hours ({len(recent)} total):**\n\n" + "\n".join(lines), parse_mode='markdown')
+
+
+async def handle_download(event: Any, admin_id: Optional[int]):
+    """Admin: Download a specific file strictly within Media folder."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+        
+    args = event.text.split(maxsplit=1)
+    if len(args) < 2:
+        await event.reply("❌ Usage: `/download <relative_path_in_media>`")
+        return
+        
+    target = resolve_safe_media_path(args[1], MEDIA_DIR)
+    if not target or not os.path.exists(target) or os.path.isdir(target):
+        await event.reply("❌ Invalid path or file not found within Media directory.")
+        return
+        
+    sz = os.path.getsize(target)
+    if sz > 1900 * 1024 * 1024:
+        await event.reply("⚠️ File exceeds 1.9 GB Telegram upload limit.")
+        return
+        
+    await event.reply(f"📤 Uploading `{os.path.basename(target)}` ({sz / (1024*1024):.2f} MB)...")
+    try:
+        await event.client.send_file(event.chat_id, target, force_document=True)
+    except Exception as e:
+        await event.reply(f"❌ Upload error: {e}")
+
+
+async def handle_download_zip(event: Any, admin_id: Optional[int]):
+    """Admin: Download a folder within Media as a ZIP archive."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+        
+    args = event.text.split(maxsplit=1)
+    if len(args) < 2:
+        await event.reply("❌ Usage: `/download_zip <relative_folder_in_media>`")
+        return
+        
+    target = resolve_safe_media_path(args[1], MEDIA_DIR)
+    if not target or not os.path.exists(target) or not os.path.isdir(target):
+        await event.reply("❌ Invalid folder path or folder not found within Media directory.")
+        return
+        
+    zip_path = os.path.join(BACKUPS_DIR, f"folder_{int(time.time())}.zip")
+    await event.reply(f"📦 Creating ZIP archive for `{os.path.basename(target)}`...")
+    
+    def make_zip():
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(target):
+                for file in files:
+                    fp = os.path.join(root, file)
+                    arc = os.path.relpath(fp, target)
+                    zipf.write(fp, arc)
+                    
+    await asyncio.to_thread(make_zip)
+    
+    try:
+        if os.path.exists(zip_path) and os.path.getsize(zip_path) <= 1900 * 1024 * 1024:
+            await event.client.send_file(event.chat_id, zip_path, force_document=True)
+        else:
+            await event.reply("⚠️ Archive exceeds Telegram file size limit.")
+    finally:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+
+async def handle_delete(event: Any, admin_id: Optional[int]):
+    """Admin: Request deletion confirmation for a file strictly within Media folder."""
+    if not await is_admin(event, admin_id):
+        return
+    args = event.text.split(maxsplit=1)
+    if len(args) < 2:
+        await event.reply("❌ Usage: `/delete <relative_file_path>`")
+        return
+    target = resolve_safe_media_path(args[1], MEDIA_DIR)
+    if not target or not os.path.exists(target) or os.path.isdir(target):
+        await event.reply("❌ Invalid path or file not found within Media directory.")
+        return
+    rel = os.path.relpath(target, MEDIA_DIR)
+    await event.reply(f"⚠️ Confirm deletion of `{rel}`?\nRun: `/confirm_delete {rel}`")
+
+
+async def handle_confirm_delete(event: Any, admin_id: Optional[int]):
+    """Admin: Confirm deletion of a file strictly within Media folder."""
+    if not await is_admin(event, admin_id):
+        return
+    args = event.text.split(maxsplit=1)
+    if len(args) < 2:
+        return
+    target = resolve_safe_media_path(args[1], MEDIA_DIR)
+    if not target or not os.path.exists(target) or os.path.isdir(target):
+        await event.reply("❌ Invalid path or file not found.")
+        return
+    os.remove(target)
+    await event.reply(f"✅ File deleted: `{os.path.basename(target)}`")
+
+
+async def handle_all(event: Any, admin_id: Optional[int]):
+    """Admin: Send all media files in batches."""
+    if not await is_admin(event, admin_id):
+        return
+    media_files = []
+    for root, dirs, files in os.walk(MEDIA_DIR):
+        for f in files:
+            media_files.append(os.path.join(root, f))
+    if not media_files:
+        await event.reply("📭 No media files found.")
+        return
+    await event.reply(f"📤 Sending {len(media_files)} files in batches...")
+    for fp in media_files[:50]:
+        try:
+            await event.client.send_file(event.chat_id, fp)
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Error sending file {fp}: {e}")
+
+
+async def handle_zip(event: Any, admin_id: Optional[int]):
+    """Admin: Create full ZIP archive of Media directory."""
+    if not await is_admin(event, admin_id):
+        return
+    zip_path = os.path.join(BACKUPS_DIR, f"full_media_{int(time.time())}.zip")
+    await event.reply("📦 Creating full Media backup ZIP...")
+    
+    def make_full_zip():
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(MEDIA_DIR):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    arc = os.path.relpath(fp, MEDIA_DIR)
+                    zipf.write(fp, arc)
+                    
+    await asyncio.to_thread(make_full_zip)
+    try:
+        if os.path.exists(zip_path) and os.path.getsize(zip_path) <= 1900 * 1024 * 1024:
+            await event.client.send_file(event.chat_id, zip_path, force_document=True)
+        else:
+            await event.reply("⚠️ Full archive exceeds Telegram file size limit.")
+    finally:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+
+# --- ADMIN LOGS & SYSTEM COMMANDS ---
+
+async def handle_logs(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: View recent logs with secret masking."""
+    if not await is_admin(event, admin_id):
+        return
+    args = event.text.split()
+    lines_count = 50
+    search_query = None
+    if len(args) > 1:
+        if args[1].isdigit():
+            lines_count = min(int(args[1]), 500)
+        else:
+            search_query = args[1]
+    if len(args) > 2 and args[2].isdigit():
+        lines_count = min(int(args[2]), 500)
+        
+    if not os.path.exists(LOG_FILE):
+        await event.reply("📭 No log file found.")
+        return
+        
+    with open(LOG_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        all_lines = f.readlines()
+        
+    if search_query:
+        filtered = [l for l in all_lines if search_query.lower() in l.lower()]
+    else:
+        filtered = all_lines
+        
+    sample = "".join(filtered[-lines_count:])
+    if not sample:
+        await event.reply("📭 No matching log entries.")
+        return
+        
+    if len(sample) > 3800:
+        sample = sample[-3800:]
+    await event.reply(f"📋 **Bot Logs (Last {lines_count} lines):**\n```\n{sample}\n```", parse_mode='markdown')
+
+
+async def handle_clearlogs(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Rotate and clear current log file."""
+    if not await is_admin(event, admin_id):
+        return
+    if os.path.exists(LOG_FILE):
+        backup_name = os.path.join(BACKUPS_DIR, f"bot_log_backup_{int(time.time())}.log")
+        shutil.copy2(LOG_FILE, backup_name)
+        with open(LOG_FILE, 'w', encoding='utf-8') as f:
+            f.write(f"--- Log reset at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} ---\n")
+        await event.reply(f"✅ Logs cleared. Backup saved to `{os.path.basename(backup_name)}`.")
+    else:
+        await event.reply("📭 No log file found to clear.")
+
+
+async def handle_download_logs(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Download complete log file."""
+    if not await is_admin(event, admin_id):
+        return
+    if not os.path.exists(LOG_FILE):
+        await event.reply("📭 No log file found.")
+        return
+    await event.client.send_file(event.chat_id, LOG_FILE, force_document=True)
+
+
+async def handle_loglevel(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Change runtime logging level."""
+    if not await is_admin(event, admin_id):
+        return
+    args = event.text.split()
+    if len(args) < 2 or args[1].upper() not in ['DEBUG', 'INFO', 'WARNING', 'ERROR']:
+        await event.reply("❌ Usage: `/loglevel <DEBUG|INFO|WARNING|ERROR>`")
+        return
+    level = getattr(logging, args[1].upper())
+    logger.setLevel(level)
+    console_handler.setLevel(level)
+    file_handler.setLevel(level)
+    await event.reply(f"✅ Log level updated to `{args[1].upper()}`.")
+
+
+async def handle_status(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Display system overview and statistics."""
+    if not await is_admin(event, admin_id):
+        return
+    photos = videos = docs = total_size = 0
+    for root, dirs, files in os.walk(MEDIA_DIR):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                sz = os.path.getsize(p)
+                total_size += sz
+                ext = os.path.splitext(f)[1].lower()
+                if ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                    photos += 1
+                elif ext in ['.mp4', '.avi', '.mkv']:
+                    videos += 1
+                else:
+                    docs += 1
+            except Exception:
+                pass
+                
+    q_stats = await MEDIA_QUEUE.get_queue_stats() if MEDIA_QUEUE else {}
+    users_count = len(state.get("user_sessions", {}))
     
     await event.reply(
-        "❌ **Usage:**\n\n"
-        "**For Users:**\n"
-        "• `/checkmissed` - Check your own missed media\n\n"
-        "**For Admin:**\n"
-        "• `/checkmissed <user_id>` - Check specific user\n"
-        "• `/checkmissed all` - Check all users\n"
-        "• `/users` - List all logged-in users\n"
-        "• `/checkmissed_all` - Check all users (alternative)"
+        f"📊 **System Status & Statistics:**\n\n"
+        f"📁 **Media Storage:**\n"
+        f"• Photos: {photos} | Videos: {videos} | Documents: {docs}\n"
+        f"• Total Size: {total_size / (1024*1024):.2f} MB\n\n"
+        f"👥 **Users & Sessions:**\n"
+        f"• Active Connected Sessions: {users_count}\n"
+        f"• Global Forwarding: {'✅ ON' if state.get('global_forwarding_enabled', True) else '❌ OFF'}\n\n"
+        f"📥 **Queue State:**\n"
+        f"• Pending: {q_stats.get('pending_count', 0)}\n"
+        f"• Processed: {q_stats.get('total_processed', 0)}"
     )
 
 
-async def handle_checkmissed_user(event, admin_id, state, target_user_id):
-    """Admin: Check missed media for specific user"""
+async def handle_ping(event: Any):
+    """Admin: Measure network ping latency."""
+    start = time.perf_counter()
+    msg = await event.reply("🏓 Pong...")
+    elapsed = (time.perf_counter() - start) * 1000
+    await msg.edit(f"🏓 **Pong!** Latency: `{elapsed:.2f} ms`")
+
+
+async def handle_queue_stats_all(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Show queue statistics across all users."""
     if not await is_admin(event, admin_id):
-        await event.reply("❌ Admin only command.")
+        await event.reply("❌ You are not authorized to use this command.")
         return
-    
+    stats = await MEDIA_QUEUE.get_queue_stats() if MEDIA_QUEUE else {}
+    msg = (
+        f"📊 **Global Queue Statistics (Admin):**\n\n"
+        f"• Pending: {stats.get('pending_count', 0)}\n"
+        f"• Processing: {stats.get('processing_count', 0)}\n"
+        f"• Processed: {stats.get('processed_count', 0)}\n"
+        f"• Failed: {stats.get('failed_count', 0)}\n"
+        f"• Total Completed: {stats.get('total_processed', 0)}\n\n"
+    )
+    if stats.get('pending_by_user'):
+        msg += "**Pending by User:**\n"
+        for uid, count in stats['pending_by_user'].items():
+            uname = state.get("user_sessions", {}).get(str(uid), {}).get("username") or uid
+            msg += f"• `{uname}`: {count}\n"
+    await event.reply(msg)
+
+
+async def handle_process_queue_all(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Trigger global queue processing for all users."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    await event.reply("🔄 Processing all pending items across all users...")
+    processed, failed = await process_queue_items(user_id=None, limit=20, state=state)
+    await event.reply(f"✅ Global queue processing completed: {processed} processed, {failed} failed.")
+
+
+async def handle_checkmissed_all(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Scan missed media for all connected users."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
     user_sessions = state.get("user_sessions", {})
-    target_user_str = str(target_user_id)
-    
-    if target_user_str not in user_sessions:
-        await event.reply(f"❌ User {target_user_id} is not logged in.")
+    if not user_sessions:
+        await event.reply("📭 No logged-in users.")
         return
-    
-    user_data = user_sessions[target_user_str]
-    username = user_data.get('username', f'User {target_user_id}')
-    
-    await event.reply(f"🔄 Checking missed media for user {target_user_id} (@{username})...")
-    
-    try:
-        # Load user client
-        user_session_file = get_user_session_file(target_user_id)
-        if not os.path.exists(user_session_file):
-            await event.reply(f"❌ Session file not found for user {target_user_id}")
-            return
-        
-        async with aiofiles.open(user_session_file, mode="r") as f:
-            session_string = await f.read()
-        
-        session = StringSession(session_string)
-        user_client = TelegramClient(session, user_data["api_id"], user_data["api_hash"])
-        
-        await user_client.connect()
-        
-        if await user_client.is_user_authorized():
-            found_count = await check_missed_media(target_user_id, user_client, state)
-            
-            await user_client.disconnect()
-            
-            await event.reply(
-                f"✅ **Missed Media Check Complete**\n\n"
-                f"**User:** @{username} (ID: {target_user_id})\n"
-                f"**Found:** {found_count} missed media items\n\n"
-                f"**Status:** {'Queued for processing' if found_count > 0 else 'No missed media found'}\n"
-                f"**Queue:** Use `/queue_stats` to see pending items"
-            )
-        else:
-            await user_client.disconnect()
-            await event.reply(f"❌ User {target_user_id} is not authorized.")
-            
-    except Exception as e:
-        await event.reply(f"❌ Error checking user {target_user_id}: {str(e)}")
+    await event.reply(f"🔄 Scanning missed media for {len(user_sessions)} users...")
+    total_found = 0
+    for uid_str in user_sessions.keys():
+        uid = int(uid_str)
+        client = ACTIVE_USER_CLIENTS.get(uid_str)
+        if client and client.is_connected():
+            found = await check_missed_media(uid, client, state)
+            total_found += found
+            await asyncio.sleep(1)
+    await event.reply(f"✅ Check complete: Found {total_found} total missed media items.")
 
 
-async def handle_loglevel(event, admin_id, state):
-    """Change log level"""
+async def handle_checkmissed_enhanced(event: Any, admin_id: Optional[int], state: dict):
+    """Dispatcher for /checkmissed [id|all]."""
+    args = event.text.split()
     if not await is_admin(event, admin_id):
+        await handle_checkmissed(event, admin_id, state)
         return
-    
-    try:
-        args = event.text.split()
-        if len(args) < 2:
-            await event.reply(
-                "❌ Usage: /loglevel <level>\n\n"
-                "**Available levels:**\n"
-                "• DEBUG - Detailed information, typically of interest only when diagnosing problems\n"
-                "• INFO - Confirmation that things are working as expected\n"
-                "• WARNING - An indication that something unexpected happened\n"
-                "• ERROR - Due to a more serious problem, the software has not been able to perform some function\n\n"
-                "Example: `/loglevel DEBUG`"
-            )
-            return
-        
-        level = args[1].upper()
-        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR']
-        
-        if level not in valid_levels:
-            await event.reply(
-                f"❌ Invalid log level: `{level}`\n"
-                f"Valid levels are: {', '.join(valid_levels)}"
-            )
-            return
-        
-        # Convert string level to logging constant
-        level_map = {
-            'DEBUG': logging.DEBUG,
-            'INFO': logging.INFO,
-            'WARNING': logging.WARNING,
-            'ERROR': logging.ERROR
-        }
-        
-        log_level = level_map[level]
-        
-        # Update logger level
-        logger.setLevel(log_level)
-        
-        # Update all handlers
-        for handler in logger.handlers:
-            handler.setLevel(log_level)
-        
-        # Log the change
-        logger.info(f"Log level changed to {level}")
-        
-        await event.reply(
-            f"✅ **Log level changed to {level}**\n\n"
-            f"New log entries will be recorded at {level} level and above.\n"
-            f"Use /logs to view current logs."
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in /loglevel command: {str(e)}")
-        await event.reply(f"❌ Error changing log level: {str(e)}")
+    if len(args) > 1:
+        if args[1].lower() == 'all':
+            await handle_checkmissed_all(event, admin_id, state)
+        elif args[1].isdigit():
+            target_uid = int(args[1])
+            client = ACTIVE_USER_CLIENTS.get(str(target_uid))
+            if client and client.is_connected():
+                found = await check_missed_media(target_uid, client, state)
+                await event.reply(f"✅ Check complete for user `{target_uid}`: Found {found} missed items.")
+            else:
+                await event.reply(f"❌ User `{target_uid}` is not currently connected.")
+        else:
+            await event.reply("❌ Usage: `/checkmissed <user_id|all>`")
+    else:
+        await handle_checkmissed(event, admin_id, state)
 
+
+# --- ADMIN USER MANAGEMENT COMMANDS ---
+
+async def handle_users(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Display all users categorized by Administrator, Authorized, and Inactive."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+        
+    effective_admin_id = parse_admin_id(admin_id) or CONFIGURED_ADMIN_ID
+    user_sessions = state.get("user_sessions", {})
+    
+    # Administrator details
+    admin_session = user_sessions.get(str(effective_admin_id))
+    admin_username = admin_session.get('username') if admin_session else "Unknown"
+    admin_status = "🟢 Active Session" if admin_session else "⚪ No active user session"
+    
+    msg = "👑 **Administrator (Bot Owner):**\n"
+    msg += f"• User ID: `{effective_admin_id}` (@{admin_username})\n"
+    msg += f"• Session: {admin_status}\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    env_users = parse_allowed_users(os.getenv("ALLOWED_USERS", ""))
+    db_users = await MEDIA_QUEUE.get_all_users_db() if MEDIA_QUEUE else []
+    
+    active_db_users = [u for u in db_users if u['is_active'] and u['user_id'] != effective_admin_id]
+    inactive_db_users = [u for u in db_users if not u['is_active'] and u['user_id'] != effective_admin_id]
+    
+    all_auth = set(env_users)
+    for u in active_db_users:
+        all_auth.add(u['user_id'])
+    for u_str in user_sessions.keys():
+        try:
+            all_auth.add(int(u_str))
+        except Exception:
+            pass
+    all_auth.discard(effective_admin_id)
+    
+    msg += f"✅ **Authorized Users ({len(all_auth)}):**\n"
+    if not all_auth:
+        msg += "• _No other authorized users configured_\n\n"
+    else:
+        for uid in sorted(all_auth):
+            sess = user_session_info = user_sessions.get(str(uid))
+            uname = sess.get('username') if sess else "Unknown"
+            status_tag = "🟢 Logged In" if sess else "⚪ Disconnected"
+            msg += f"• `{uid}` (@{uname}) - {status_tag}\n"
+        msg += "\n"
+        
+    if inactive_db_users:
+        msg += f"⛔ **Inactive / Disallowed Users ({len(inactive_db_users)}):**\n"
+        for u in inactive_db_users:
+            msg += f"• `{u['user_id']}` (@{u.get('username') or 'No username'})\n"
+        msg += "\n"
+        
+    await event.reply(msg, parse_mode='markdown')
+
+
+async def handle_allow_user(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Authorize a user in the database."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    args = event.text.split()
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await event.reply("❌ Usage: `/allow_user <user_id>`")
+        return
+    target_uid = int(args[1].strip())
+    if is_admin_id(target_uid, admin_id):
+        await event.reply(f"ℹ️ User `{target_uid}` is the Administrator (always authorized).")
+        return
+        
+    username = "Unknown"
+    try:
+        ent = await event.client.get_entity(target_uid)
+        username = getattr(ent, 'username', None) or getattr(ent, 'first_name', 'Unknown')
+    except Exception:
+        pass
+        
+    if MEDIA_QUEUE:
+        await MEDIA_QUEUE.add_allowed_user(target_uid, username, event.sender_id)
+        await event.reply(f"✅ User `{target_uid}` (@{username}) has been authorized.")
+    else:
+        await event.reply("❌ Database not initialized.")
+
+
+async def handle_disallow_user(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Deactivate a user's authorization."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    args = event.text.split()
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await event.reply("❌ Usage: `/disallow_user <user_id>`")
+        return
+    target_uid = int(args[1].strip())
+    if is_admin_id(target_uid, admin_id):
+        await event.reply("❌ The bot administrator cannot be disallowed.")
+        return
+    if MEDIA_QUEUE:
+        await MEDIA_QUEUE.remove_allowed_user(target_uid)
+        await event.reply(f"✅ User `{target_uid}` has been disallowed.")
+    else:
+        await event.reply("❌ Database not initialized.")
+
+
+async def handle_allowed_users(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Display allowed users overview."""
+    await handle_users(event, admin_id, state)
+
+
+async def handle_help_full(event: Any, admin_id: Optional[int], state: dict):
+    """Admin: Send complete documentation as a markdown file."""
+    if not await is_admin(event, admin_id):
+        await event.reply("❌ You are not authorized to use this command.")
+        return
+    doc_path = os.path.join(BASE_DIR, "README.md")
+    if os.path.exists(doc_path):
+        await event.client.send_file(event.chat_id, doc_path, caption="📘 Complete Bot Documentation")
+    else:
+        await event.reply("📭 Documentation file not found.")
+
+
+async def handle_help(event: Any, admin_id: Optional[int], state: dict):
+    """Show help documentation according to user role."""
+    is_adm = await is_admin(event, admin_id)
+    if is_adm:
+        msg = (
+            "👑 **Self-Destructing Bot - Administrator Help**\n\n"
+            "**User Access Control:**\n"
+            "• `/users` - List all users by status\n"
+            "• `/allow_user <id>` - Authorize a user\n"
+            "• `/disallow_user <id>` - Disallow a user\n\n"
+            "**Channel Management:**\n"
+            "• `/setgchannel <id>` - Set bot's global channel\n"
+            "• `/currentchannel` - Show global channel config\n"
+            "• `/testchannel` - Test global channel posting\n"
+            "• `/globalforward <enable|disable|status>` - Toggle forwarding\n\n"
+            "**File Management:**\n"
+            "• `/files` - List files in Media folder\n"
+            "• `/check` - Check recent files (24h)\n"
+            "• `/download <path>` - Download a file\n"
+            "• `/download_zip <folder>` - Download folder as ZIP\n"
+            "• `/zip` - Download entire Media backup\n"
+            "• `/delete <path>` - Delete a file\n\n"
+            "**Queue & Diagnostics:**\n"
+            "• `/queue_stats_all` - View all queues\n"
+            "• `/process_queue_all` - Process all queues\n"
+            "• `/checkmissed_all` - Scan all users' missed media\n"
+            "• `/status` - Storage and system stats\n"
+            "• `/logs` - View recent logs\n"
+            "• `/loglevel <level>` - Change log level\n"
+            "• `/help_full` - Download complete documentation"
+        )
+    else:
+        msg = (
+            "🤖 **Self-Destructing Bot - User Guide**\n\n"
+            "**Account & Channel:**\n"
+            "• `/login` - Connect your Telegram account\n"
+            "• `/logout` - Disconnect your account\n"
+            "• `/mystatus` - View your connection status\n"
+            "• `/setmychannel <id>` - Set your personal channel\n"
+            "• `/mychannel` - View personal channel\n"
+            "• `/mychanneltest` - Test personal channel access\n\n"
+            "**Media Recovery & Queue:**\n"
+            "• `/checkmissed` - Scan last 48h for missed media\n"
+            "• `/queue_stats` - View your pending media queue\n"
+            "• `/process_queue` - Process your queue immediately\n"
+            "• `/savetips` - Tips for self-destructing media"
+        )
+    await event.reply(msg, parse_mode='markdown')
+
+
+# =====================================================================
+# MAIN BOT LIFECYCLE & BACKGROUND WORKERS
+# =====================================================================
 
 async def main():
-    """Main function to run the bot"""
-    global MEDIA_QUEUE
+    """Main application lifecycle and entrypoint."""
+    global MEDIA_QUEUE, CONFIGURED_ADMIN_ID, BOT_CLIENT
+    
+    # Initialize SQLite database and queue
     MEDIA_QUEUE = MediaQueue()
     
+    # Load configuration
     api_id, api_hash, admin_id, bot_token, session_name, channel_id = await load_config()
     
     if not bot_token:
-        console.print("[red]Bot token is required![/red]")
-        console.print("[yellow]This bot only works with bot token.[/yellow]")
+        console.print("[red]❌ Configuration Error: BOT_TOKEN is required in .env![/red]")
+        logger.critical("BOT_TOKEN missing. Shutting down.")
         return
-    
-    # Display warning about API sharing
-    console.print("[yellow]⚠️  WARNING: Users can use /skip to use bot's API credentials[/yellow]")
-    console.print("[yellow]⚠️  This is risky and may lead to account bans[/yellow]")
-    console.print("[yellow]⚠️  Consider disabling /skip in production[/yellow]")
-    
-    # Load bot state
+        
+    if not api_id or not api_hash:
+        console.print("[red]❌ Configuration Error: API_ID and API_HASH are required in .env![/red]")
+        logger.critical("API_ID or API_HASH missing. Shutting down.")
+        return
+        
+    if admin_id is None:
+        console.print("[red]❌ Configuration Error: ADMIN_ID is required and must be a positive integer![/red]")
+        logger.critical("ADMIN_ID missing or invalid. Shutting down.")
+        return
+        
+    CONFIGURED_ADMIN_ID = admin_id
     state = await load_state()
     
-    # Initialize client with bot token only
-    client = TelegramClient(
-        session=session_name,
-        api_id=int(api_id),
-        api_hash=api_hash
-    )
+    console.print(f"[green]✓ Authorization initialized. Administrator: {admin_id}[/green]")
+    logger.info(f"Bot initialized. Administrator configured: {admin_id}")
     
-    # Store channel_id in client object for easy access
-    if channel_id:
-        try:
-            # Convert to integer if it's a string
-            if isinstance(channel_id, str):
-                channel_id = int(channel_id)
-            client.channel_id = channel_id
-        except (ValueError, TypeError):
-            client.channel_id = None
-            console.print("[yellow]Warning: Invalid channel ID in settings[/yellow]")
-    else:
-        client.channel_id = None
-    
-    # Store admin_id in client for easy access
+    # Initialize bot client
+    client = TelegramClient(session_name, api_id, api_hash)
+    client.channel_id = channel_id
     client.admin_id = admin_id
-    
-    # Store bot client globally for user sessions
-    global BOT_CLIENT
     BOT_CLIENT = client
     
-    # ===== EVENT HANDLERS =====
-    @client.on(events.NewMessage(pattern='/start'))
-    async def start_handler(event):
-        await handle_start(event, admin_id)
+    # Register command handlers
+    client.on(events.NewMessage(pattern=r'^/start$'))(lambda e: handle_start(e, admin_id))
+    client.on(events.NewMessage(pattern=r'^/help$'))(lambda e: handle_help(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/ping$'))(handle_ping)
+    client.on(events.NewMessage(pattern=r'^/status$'))(lambda e: handle_status(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/files$'))(lambda e: handle_files(e, admin_id))
+    client.on(events.NewMessage(pattern=r'^/check$'))(lambda e: handle_check(e, admin_id))
+    client.on(events.NewMessage(pattern=r'^/all$'))(lambda e: handle_all(e, admin_id))
+    client.on(events.NewMessage(pattern=r'^/zip$'))(lambda e: handle_zip(e, admin_id))
     
-    @client.on(events.NewMessage(pattern='/help'))
-    async def help_handler(event):
-        await handle_help(event, admin_id, state)
+    client.on(events.NewMessage(pattern=r'/download\s+(.+)?'))(lambda e: handle_download(e, admin_id))
+    client.on(events.NewMessage(pattern=r'/download_zip\s+(.+)?'))(lambda e: handle_download_zip(e, admin_id))
+    client.on(events.NewMessage(pattern=r'/delete\s+(.+)?'))(lambda e: handle_delete(e, admin_id))
+    client.on(events.NewMessage(pattern=r'/confirm_delete\s+(.+)?'))(lambda e: handle_confirm_delete(e, admin_id))
     
-    @client.on(events.NewMessage(pattern='/ping'))
-    async def ping_handler(event):
-        await handle_ping(event)
+    client.on(events.NewMessage(pattern=r'/globalforward(?:\s+\S+)?'))(lambda e: handle_globalforward(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'/globleforward(?:\s+\S+)?'))(lambda e: handle_globalforward(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'/setgchannel\s+(.+)?'))(lambda e: handle_setgchannel(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'/setmychannel\s+(.+)?'))(lambda e: handle_setmychannel(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/currentchannel$'))(lambda e: handle_currentchannel(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/testchannel$'))(lambda e: handle_testchannel(e, admin_id))
+    client.on(events.NewMessage(pattern=r'^/mychannel$'))(lambda e: handle_mychannel(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/mychanneltest$'))(lambda e: handle_mychanneltest(e, admin_id, state))
     
-    @client.on(events.NewMessage(pattern='/status'))
-    async def status_handler(event):
-        await handle_status(event, admin_id, state)
+    client.on(events.NewMessage(pattern=r'/logs(?:\s+\S+)*'))(lambda e: handle_logs(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/clearlogs$'))(lambda e: handle_clearlogs(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/download_logs$'))(lambda e: handle_download_logs(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'/loglevel\s+\S+'))(lambda e: handle_loglevel(e, admin_id, state))
     
-    @client.on(events.NewMessage(pattern='/files'))
-    async def files_handler(event):
-        await handle_files(event, admin_id)
+    client.on(events.NewMessage(pattern=r'^/login$'))(lambda e: handle_login(e, admin_id, client, state))
+    client.on(events.NewMessage(pattern=r'^/cancel$'))(lambda e: handle_cancel(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/logout$'))(lambda e: handle_logout(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/mystatus$'))(lambda e: handle_mystatus(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/savetips$'))(handle_savetips)
+    client.on(events.NewMessage(pattern=r'^/help_full$'))(lambda e: handle_help_full(e, admin_id, state))
     
-    @client.on(events.NewMessage(pattern=r'^/check$'))
-    async def check_handler(event):
-        await handle_check(event, admin_id)
+    client.on(events.NewMessage(pattern=r'^/queue_stats(?:\s|$)'))(lambda e: handle_queue_stats(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/process_queue(?:\s|$)'))(lambda e: handle_process_queue(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/queue_stats_all(?:\s|$)'))(lambda e: handle_queue_stats_all(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/process_queue_all(?:\s|$)'))(lambda e: handle_process_queue_all(e, admin_id, state))
     
-    @client.on(events.NewMessage(pattern=r'/download\s+(.+)?'))
-    async def download_handler(event):
-        await handle_download(event, admin_id)
-
-    @client.on(events.NewMessage(pattern=r'/download_zip\s+(.+)?'))
-    async def download_zip_handler(event):
-        await handle_download_zip(event, admin_id)
+    client.on(events.NewMessage(pattern=r'^/checkmissed(?:\s+\S+)?$'))(lambda e: handle_checkmissed_enhanced(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/checkmissed_all$'))(lambda e: handle_checkmissed_all(e, admin_id, state))
     
-    @client.on(events.NewMessage(pattern=r'/delete\s+(.+)?'))
-    async def delete_handler(event):
-        await handle_delete(event, admin_id)
+    client.on(events.NewMessage(pattern=r'^/users$'))(lambda e: handle_users(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/allow_user\s+\d+$'))(lambda e: handle_allow_user(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/disallow_user\s+\d+$'))(lambda e: handle_disallow_user(e, admin_id, state))
+    client.on(events.NewMessage(pattern=r'^/allowed_users$'))(lambda e: handle_allowed_users(e, admin_id, state))
     
-    @client.on(events.NewMessage(pattern=r'/globalforward(?:\s+\S+)?'))
-    async def globalforward_handler(event):
-        await handle_globalforward(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern=r'/globleforward(?:\s+\S+)?'))
-    async def globleforward_handler(event):
-        await handle_globalforward(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern=r'/confirm_delete\s+(.+)?'))
-    async def confirm_delete_handler(event):
-        await handle_confirm_delete(event, admin_id)
-    
-    @client.on(events.NewMessage(pattern='/all'))
-    async def all_handler(event):
-        await handle_all(event, admin_id)
-    
-    @client.on(events.NewMessage(pattern='/zip'))
-    async def zip_handler(event):
-        await handle_zip(event, admin_id)
-    
-    @client.on(events.NewMessage(pattern=r'/setgchannel\s+(.+)?'))
-    async def setgchannel_handler(event):
-        await handle_setgchannel(event, admin_id, state)
-
-    @client.on(events.NewMessage(pattern=r'/setmychannel\s+(.+)?'))
-    async def setmychannel_handler(event):
-        await handle_setmychannel(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/currentchannel'))
-    async def currentchannel_handler(event):
-        await handle_currentchannel(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/testchannel'))
-    async def testchannel_handler(event):
-        await handle_testchannel(event, admin_id)
-    
-    # Log management commands
-    @client.on(events.NewMessage(pattern=r'/logs(?:\s+\S+)*'))
-    async def logs_handler(event):
-        await handle_logs(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/clearlogs'))
-    async def clearlogs_handler(event):
-        await handle_clearlogs(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/download_logs'))
-    async def download_logs_handler(event):
-        await handle_download_logs(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern=r'/loglevel\s+\S+'))
-    async def loglevel_handler(event):
-        await handle_loglevel(event, admin_id, state)
-    
-    # User session commands
-    @client.on(events.NewMessage(pattern='/login'))
-    async def login_handler(event):
-        await handle_login(event, admin_id, client, state)
-    
-    @client.on(events.NewMessage(pattern='/skip'))
-    async def skip_handler(event):
-        await handle_skip(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/cancel'))
-    async def cancel_handler(event):
-        await handle_cancel(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/logout'))
-    async def logout_handler(event):
-        await handle_logout(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/mystatus'))
-    async def mystatus_handler(event):
-        await handle_mystatus(event, admin_id, state)
-    
-    # User channel commands
-    @client.on(events.NewMessage(pattern='/mychannel'))
-    async def mychannel_handler(event):
-        await handle_mychannel(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/mychanneltest'))
-    async def mychanneltest_handler(event):
-        await handle_mychanneltest(event, admin_id, state)
-    
-    # Self-destructing media tips
-    @client.on(events.NewMessage(pattern='/savetips'))
-    async def savetips_handler(event):
-        await handle_savetips(event)
-    
-    # ===== ENHANCED /checkmissed COMMAND =====
-    @client.on(events.NewMessage(pattern=r'^/checkmissed(?:\s+\S+)?$'))
-    async def checkmissed_enhanced_handler(event):
-        await handle_checkmissed_enhanced(event, admin_id, state)
-    
-    # ===== ADMIN USER MANAGEMENT COMMANDS =====
-    @client.on(events.NewMessage(pattern='/users'))
-    async def users_handler(event):
-        await handle_users(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/checkmissed_all'))
-    async def checkmissed_all_handler(event):
-        await handle_checkmissed_all(event, admin_id, state)
-    
-    # ===== QUEUE MANAGEMENT COMMANDS =====
-    @client.on(events.NewMessage(pattern='/queue_stats'))
-    async def queue_stats_handler(event):
-        await handle_queue_stats(event, admin_id, state)
-    
-    @client.on(events.NewMessage(pattern='/process_queue'))
-    async def process_queue_handler(event):
-        await handle_process_queue(event, admin_id, state)
-    
-    # Handle plain messages during login (not starting with /)
+    # Plain text messages in private chat for login flow steps
     @client.on(events.NewMessage(func=lambda e: e.is_private and e.text and not e.text.startswith('/')))
     async def plain_message_handler(event):
-        """Handle plain messages during login process"""
-        user_id = event.sender_id
-        user_data = state.get("login_sessions", {}).get(str(user_id))
-        
+        uid = event.sender_id
+        user_data = state.get("login_sessions", {}).get(str(uid))
         if not user_data:
             return
-        
-        current_step = user_data.get("step")
-        
-        if current_step == "api_id":
+        step = user_data.get("step")
+        if step == "api_id":
             await handle_api_id(event, admin_id, state)
-        elif current_step == "api_hash":
+        elif step == "api_hash":
             await handle_api_hash(event, admin_id, state)
-        elif current_step == "phone":
+        elif step == "phone":
             await handle_phone(event, admin_id, state, client)
-        elif current_step == "code":
+        elif step == "code":
             await handle_code(event, admin_id, state)
-        elif current_step == "2fa":
+        elif step == "2fa":
             await handle_2fa(event, admin_id, state)
-        elif current_step == "skip_confirmation":
-            await handle_skip_confirmation(event, admin_id, state)
-    
-    # Universal media handler - catches ALL media including self-destructing
+            
+    # Universal handler for messages sent directly to bot token
     @client.on(events.NewMessage(func=lambda e: e.is_private))
     async def universal_media_handler(event):
-        """Detect media & self-destructing messages sent to the bot"""
-        try:
-            # Ignore commands
-            if event.text and event.text.startswith("/"):
-                return
-
-            # ✅ Ignore logged-in users (handled by user client)
-            if str(event.sender_id) in state.get("user_sessions", {}):
-                return
-
-            has_media = bool(event.media)
-            is_self_destruct = False
+        if event.text and event.text.startswith("/"):
+            return
+        if str(event.sender_id) in state.get("user_sessions", {}):
+            return  # Handled by user client
             
-            if hasattr(event.media, 'ttl_seconds'):
-                is_self_destruct = bool(event.media.ttl_seconds)
-            elif hasattr(event.media, 'photo') and hasattr(event.media.photo, 'ttl_seconds'):
-                is_self_destruct = bool(event.media.photo.ttl_seconds)
-            elif hasattr(event.media, 'document') and hasattr(event.document, 'ttl_seconds'):
-                is_self_destruct = bool(event.document.ttl_seconds)
-
-            if not has_media and not is_self_destruct:
-                return
-
-            console.print("[yellow]Bot received media[/yellow]")
-            console.print(f"[cyan]Sender: {event.sender_id}[/cyan]")
-            console.print(f"[cyan]Has media: {has_media}[/cyan]")
-            console.print(f"[cyan]Self-destruct: {is_self_destruct}[/cyan]")
-
-            # TTL → explain limitation
-            if is_self_destruct:
-                await event.reply(
-                    "⚠️ **Self-destructing media detected**\n\n"
-                    "Telegram does NOT allow bots to save this type of media.\n\n"
-                    "✅ **What you must do:**\n"
-                    "1. Login using `/login`\n"
-                    "2. Set your personal channel with `/setchannel`\n"
-                    "3. Receive self-destructing media in your account\n"
-                    "4. Bot will automatically save it to BOTH channels\n"
-                    "5. Works even when server was offline!\n"
-                    "6. Check missed media with `/checkmissed`\n\n"
-                    "Use /savetips for details.",
-                    parse_mode="markdown"
-                )
-                return
-
-            # Normal media
+        ttl = extract_ttl(event.message)
+        if ttl and ttl > 0:
             await event.reply(
-                "📥 Media received.\n\n"
-                "⚠️ For automatic saving of self-destructing media, "
-                "you must login with `/login` and set your channel with `/setchannel`.\n\n"
-                "✅ **NEW:** Offline media recovery is now available! Use /checkmissed after login."
+                "⚠️ **Self-destructing media detected**\n\n"
+                "Telegram does not permit bots to download TTL media directly.\n"
+                "To capture self-destructing media:\n"
+                "1. Connect your account via `/login`\n"
+                "2. Configure your channel via `/setmychannel`\n"
+                "3. Media sent to your account will automatically be saved."
             )
-
-        except Exception as e:
-            console.print(f"[red]Universal handler error: {e}[/red]")
-    
+            
     try:
-        # Start the bot with bot token only
-        await client.start(bot_token=bot_token)
-        
+        # Connect Bot Client
+        await cast(Any, client.start(bot_token=bot_token))
         me = await client.get_me()
+        console.print(f"[green]✓ Bot @{me.username} (ID: {me.id}) started successfully![/green]")
+        logger.info(f"Bot @{me.username} connected.")
         
-        console.print(f"[green]✓ Bot started successfully with Bot Token![/green]")
-        console.print(f"[cyan]Bot: @{me.username}[/cyan]")
-        console.print(f"[cyan]Bot ID: {me.id}[/cyan]")
-        console.print(f"[yellow]Admin ID: {admin_id}[/yellow]")
-        
-        if client.channel_id:
+        # Restore active user sessions
+        for uid_str, udata in state.get("user_sessions", {}).items():
             try:
-                channel_entity = await client.get_entity(client.channel_id)
-                console.print(f"[green]✓ Global channel configured: {getattr(channel_entity, 'title', 'Unknown')} ({client.channel_id})[/green]")
+                uid = int(uid_str)
+                sfile = get_user_session_file(uid)
+                if sfile and os.path.exists(sfile):
+                    async with aiofiles.open(sfile, mode="r") as sf:
+                        sstring = await sf.read()
+                    if sstring:
+                        uclient = TelegramClient(StringSession(sstring), udata["api_id"], udata["api_hash"])
+                        await uclient.connect()
+                        if await uclient.is_user_authorized():
+                            await setup_user_client_handlers(uclient, uid, client, state)
+                            ACTIVE_USER_CLIENTS[uid_str] = uclient
+                            await cast(Any, uclient.start())
+                            console.print(f"[green]✓ Restored user session: {udata.get('username') or uid}[/green]")
+                        else:
+                            await uclient.disconnect()
             except Exception as e:
-                console.print(f"[yellow]⚠ Cannot access global channel {client.channel_id}: {e}[/yellow]")
-                console.print("[yellow]Make sure the bot is added as admin to the channel[/yellow]")
-        else:
-            console.print("[yellow]⚠ No global channel configured. Use /setchannel to set one.[/yellow]")
-        
-        # ✅ NEW: Bot startup पर automatically सभी logged-in users के missed media check करें
-        console.print("[cyan]Auto-checking missed media for all logged-in users on startup...[/cyan]")
-        user_sessions = state.get("user_sessions", {})
-        
-        if user_sessions:
-            console.print(f"[cyan]Found {len(user_sessions)} logged-in users[/cyan]")
-            for user_id_str, user_data in user_sessions.items():
-                try:
-                    user_id = int(user_id_str)
-                    username = user_data.get('username', f'User {user_id}')
-                    
-                    # Check if user client is already active
-                    user_client = ACTIVE_USER_CLIENTS.get(user_id_str)
-                    
-                    if user_client and user_client.is_connected():
-                        console.print(f"[cyan]Auto-checking missed media for user {user_id} (@{username})...[/cyan]")
-                        
-                        # Run in background without waiting
-                        asyncio.create_task(
-                            check_missed_media(user_id, user_client, state)
-                        )
-                        
-                        # Small delay to avoid rate limiting
-                        await asyncio.sleep(1)
-                        
-                except Exception as e:
-                    console.print(f"[yellow]Could not auto-check for user {user_id_str}: {e}[/yellow]")
-        else:
-            console.print("[cyan]No logged-in users found for auto-check[/cyan]")
-        
-        # Process queued media on startup
-        console.print("[cyan]Processing queued media on startup...[/cyan]")
-        await process_queued_media()
-        
-        # Show logged in users
-        logged_in_users = len(state.get("user_sessions", {}))
-        users_with_channels = sum(1 for user_data in state.get("user_sessions", {}).values() if user_data.get("channel_id"))
-        console.print(f"[cyan]Logged-in users: {logged_in_users}[/cyan]")
-        console.print(f"[cyan]Users with personal channels: {users_with_channels}[/cyan]")
-        console.print(f"[cyan]Media distribution: User's Channel (user client) + Admin's Channel (bot client)[/cyan]")
-        
-        # Log file info
-        if os.path.exists(LOG_FILE):
-            log_size = os.path.getsize(LOG_FILE)
-            log_size_str = f"{log_size/1024:.1f} KB" if log_size < 1024*1024 else f"{log_size/(1024*1024):.2f} MB"
-            console.print(f"[cyan]Log file: {LOG_FILE} ({log_size_str})[/cyan]")
-        else:
-            console.print(f"[yellow]Log file not created yet[/yellow]")
-        
-        # Database info
-        if os.path.exists(DB_FILE):
-            db_size = os.path.getsize(DB_FILE)
-            db_size_str = f"{db_size/1024:.1f} KB" if db_size < 1024*1024 else f"{db_size/(1024*1024):.2f} MB"
-            console.print(f"[cyan]Database file: {DB_FILE} ({db_size_str})[/cyan]")
-        
-        # Restore existing user sessions
-        for user_id_str, user_data in state.get("user_sessions", {}).items():
-            try:
-                user_id = int(user_id_str)
-                user_session_file = user_data.get("session_file")
+                logger.error(f"Error restoring user session {uid_str}: {e}")
                 
-                if user_session_file and os.path.exists(user_session_file):
-                    async with aiofiles.open(user_session_file, mode="r") as f:
-                        session_string = await f.read()
-                    
-                    session = StringSession(session_string)
-                    user_client = TelegramClient(
-                        session,
-                        user_data["api_id"],
-                        user_data["api_hash"]
-                    )
-                    
-                    await user_client.connect()
-                    if await user_client.is_user_authorized():
-                        console.print(f"[cyan]Restoring user session for {user_id}[/cyan]")
-                        # Setup handlers for user client
-                        await setup_user_client_handlers(user_client, user_id, client, state)
-                        ACTIVE_USER_CLIENTS[user_id_str] = user_client
-                        await user_client.start()
-                        
-                        channel_status = "with channel" if user_data.get("channel_id") else "no channel"
-                        console.print(f"[green]✓ Restored user session: {user_data.get('username', 'Unknown')} ({channel_status})[/green]")
-                    else:
-                        await user_client.disconnect()
-                        console.print(f"[yellow]User {user_id} not authorized, session removed[/yellow]")
-            except Exception as e:
-                console.print(f"[red]Error restoring user session {user_id_str}: {e}[/red]")
+        # Background worker tasks
+        queue_interval = int(os.getenv("QUEUE_INTERVAL", "300"))
+        autocheck_interval = int(os.getenv("AUTOCHECK_INTERVAL", "3600"))
         
-        # ===== PERIODIC TASKS =====
         async def periodic_queue_processor():
-            """Process queued media every 5 minutes"""
             while True:
                 try:
+                    await asyncio.sleep(queue_interval)
                     if client.is_connected():
-                        console.print("[cyan]Running periodic queue processor...[/cyan]")
                         await process_queued_media()
-                    await asyncio.sleep(300)  # Run every 5 minutes
+                except asyncio.CancelledError:
+                    break
                 except Exception as e:
-                    console.print(f"[red]Queue processor error: {e}[/red]")
-                    await asyncio.sleep(60)
-        
-        async def periodic_auto_check_missed(state):
-            """Periodically check missed media for all logged-in users"""
+                    logger.error(f"Periodic queue worker error: {e}")
+                    await asyncio.sleep(10)
+                    
+        async def periodic_auto_check_missed():
             while True:
                 try:
-                    await asyncio.sleep(3600)  # 1 hour
-                    
-                    console.print("[cyan]Running periodic auto-check for all users...[/cyan]")
-                    
+                    await asyncio.sleep(autocheck_interval)
                     user_sessions = state.get("user_sessions", {})
-                    for user_id_str, user_data in user_sessions.items():
-                        try:
-                            user_id = int(user_id_str)
-                            user_client = ACTIVE_USER_CLIENTS.get(user_id_str)
-                            
-                            if user_client and user_client.is_connected():
-                                console.print(f"[cyan]Auto-checking user {user_id}...[/cyan]")
-                                await check_missed_media(user_id, user_client, state)
-                                await asyncio.sleep(30)  # 30 seconds delay between users
-                                
-                        except Exception as e:
-                            console.print(f"[yellow]Auto-check failed for user {user_id_str}: {e}[/yellow]")
-                            
+                    for uid_str in list(user_sessions.keys()):
+                        uclient = ACTIVE_USER_CLIENTS.get(uid_str)
+                        if uclient and uclient.is_connected():
+                            await check_missed_media(int(uid_str), uclient, state)
+                            await asyncio.sleep(15)
+                except asyncio.CancelledError:
+                    break
                 except Exception as e:
-                    console.print(f"[red]Periodic auto-check error: {e}[/red]")
+                    logger.error(f"Periodic missed-media worker error: {e}")
+                    await asyncio.sleep(10)
+                    
+        worker1 = asyncio.create_task(periodic_queue_processor())
+        worker2 = asyncio.create_task(periodic_auto_check_missed())
         
-        # Start periodic queue processor
-        asyncio.create_task(periodic_queue_processor())
+        # Initial run of queue processing
+        asyncio.create_task(process_queued_media())
         
-        # Start periodic auto-check for missed media (every 1 hour)
-        asyncio.create_task(periodic_auto_check_missed(state))
-        
-        console.print("[green]Bot is ready! Users can login with /login and set personal channels.[/green]")
-        console.print("[green]✓ Offline media recovery is ENABLED![/green]")
-        console.print("[green]✓ Queue system is ACTIVE![/green]")
-        console.print("[green]✓ Auto-check on startup ENABLED![/green]")
-        console.print("[green]✓ Periodic auto-check (every 1 hour) ENABLED![/green]")
-        console.print("[yellow]Commands: /checkmissed, /queue_stats, /process_queue, /users[/yellow]")
-        
+        console.print("[green]✓ Background workers active. Bot is ready.[/green]")
         await client.run_until_disconnected()
         
-    except Exception as e:
-        console.print(f"[red]✗ Fatal error: {e}[/red]")
-        logger.critical(f"Bot crashed: {e}")
     finally:
-        # Disconnect all user clients
-        for user_id_str, user_client in ACTIVE_USER_CLIENTS.items():
+        # Graceful shutdown: cancel workers and disconnect all user clients
+        for task in [worker1, worker2] if 'worker1' in locals() else []:
+            task.cancel()
+        for uid_str, uclient in list(ACTIVE_USER_CLIENTS.items()):
             try:
-                await user_client.disconnect()
-            except:
+                await uclient.disconnect()
+            except Exception:
                 pass
-        
         await client.disconnect()
+        logger.info("Bot cleanly disconnected.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        console.print("\n[yellow]Bot stopped by user[/yellow]")
+        console.print("\n[yellow]Bot stopped by user.[/yellow]")
     except Exception as e:
         console.print(f"[red]Unhandled exception: {e}[/red]")
+        logger.critical(f"Bot crashed: {e}", exc_info=True)

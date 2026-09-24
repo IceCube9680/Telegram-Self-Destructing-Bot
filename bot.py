@@ -39,7 +39,7 @@ from rich.progress import (
     TransferSpeedColumn,
     TimeRemainingColumn
 )
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
 from telethon.errors import (
     FloodWaitError,
@@ -52,7 +52,16 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
-    PasswordHashInvalidError
+    PasswordHashInvalidError,
+    PhoneNumberInvalidError,
+    PhoneNumberBannedError,
+    PhoneNumberUnoccupiedError,
+    PhoneNumberFloodError,
+    SendCodeUnavailableError,
+    ApiIdInvalidError,
+    ConnectionApiIdInvalidError,
+    ApiIdPublishedFloodError,
+    AuthRestartError
 )
 
 # Load environment variables
@@ -1735,7 +1744,7 @@ async def handle_start(event: Any, admin_id: Optional[int]):
 
 
 async def handle_login(event: Any, admin_id: Optional[int], bot_client: TelegramClient, state: dict):
-    """Handle /login command."""
+    """Handle /login and /login custom command."""
     if not event.is_private:
         await event.reply("❌ Please use this command in private chat.")
         return
@@ -1792,24 +1801,56 @@ async def handle_login(event: Any, admin_id: Optional[int], bot_client: Telegram
                     os.remove(user_session_file)
             except OSError:
                 pass
-                
-    state.setdefault("login_sessions", {})
-    state["login_sessions"][str(user_id)] = {
-        "step": "api_id",
-        "api_id": None,
-        "api_hash": None,
-        "phone": None,
-        "phone_code_hash": None,
-        "session_string": None
-    }
-    await save_state(state)
+
+    text = event.text.strip() if event.text else ""
+    is_custom = "custom" in text.lower()
     
-    await event.reply(
-        "**1. Send Your Telegram API ID:**\n\n"
-        "Obtain credentials from https://my.telegram.org\n"
-        "Enter `/cancel` anytime to abort.",
-        parse_mode='markdown'
-    )
+    default_api_id = BOT_CONFIG.get("api_id") if BOT_CONFIG else None
+    if not default_api_id:
+        try:
+            default_api_id = int(os.getenv("API_ID", "0"))
+        except (ValueError, TypeError):
+            default_api_id = None
+    default_api_hash = (BOT_CONFIG.get("api_hash") if BOT_CONFIG else None) or os.getenv("API_HASH", "")
+    
+    state.setdefault("login_sessions", {})
+    
+    if not is_custom and default_api_id and default_api_hash:
+        state["login_sessions"][str(user_id)] = {
+            "step": "phone",
+            "api_id": default_api_id,
+            "api_hash": default_api_hash,
+            "phone": None,
+            "phone_code_hash": None,
+            "session_string": None
+        }
+        await save_state(state)
+        await event.reply(
+            "📱 **Telegram Account Login**\n\n"
+            "Please send your **phone number** including the country code.\n"
+            "Example: `+1234567890` or `+919876543210`\n\n"
+            "ℹ️ _Using preconfigured bot API credentials._\n"
+            "_(To enter custom API ID & Hash from my.telegram.org, send `/login custom`)_\n"
+            "_(Send `/cancel` anytime to abort)_",
+            parse_mode='markdown'
+        )
+    else:
+        state["login_sessions"][str(user_id)] = {
+            "step": "api_id",
+            "api_id": None,
+            "api_hash": None,
+            "phone": None,
+            "phone_code_hash": None,
+            "session_string": None
+        }
+        await save_state(state)
+        await event.reply(
+            "🔑 **Step 1 of 3: Send Your Telegram API ID**\n\n"
+            "Obtain your credentials from https://my.telegram.org\n"
+            "Send your numeric API ID (e.g. `12345678`).\n\n"
+            "_(Send `/cancel` anytime to abort)_",
+            parse_mode='markdown'
+        )
 
 
 async def handle_api_id(event: Any, admin_id: Optional[int], state: dict):
@@ -1825,7 +1866,7 @@ async def handle_api_id(event: Any, admin_id: Optional[int], state: dict):
         return
         
     try:
-        api_id = int(text)
+        api_id = int(re.sub(r'[^\d]', '', text))
         if api_id <= 0:
             raise ValueError()
         state["login_sessions"][str(user_id)]["api_id"] = api_id
@@ -1833,8 +1874,9 @@ async def handle_api_id(event: Any, admin_id: Optional[int], state: dict):
         await save_state(state)
         await event.reply(
             "✅ **API ID saved!**\n\n"
-            "**2. Now send your Telegram API HASH:**\n"
-            "Enter `/cancel` to abort.",
+            "🔑 **Step 2 of 3: Now send your Telegram API HASH:**\n"
+            "Example: `0123456789abcdef0123456789abcdef`\n\n"
+            "_(Send `/cancel` to abort)_",
             parse_mode='markdown'
         )
     except ValueError:
@@ -1857,9 +1899,10 @@ async def handle_api_hash(event: Any, admin_id: Optional[int], state: dict):
     state["login_sessions"][str(user_id)]["step"] = "phone"
     await save_state(state)
     await event.reply(
-        "**3. Please send your phone number with country code:**\n"
-        "Example: `+13124562345` or `+919876543210`\n\n"
-        "Enter `/cancel` to abort.",
+        "✅ **API Hash saved!**\n\n"
+        "📱 **Step 3 of 3: Please send your phone number with country code:**\n"
+        "Example: `+1234567890` or `+919876543210`\n\n"
+        "_(Send `/cancel` to abort)_",
         parse_mode='markdown'
     )
 
@@ -1871,16 +1914,26 @@ async def handle_phone(event: Any, admin_id: Optional[int], state: dict, bot_cli
     if not user_data or user_data.get("step") != "phone":
         return
         
-    text = event.text.strip()
-    if text.lower() == "/cancel":
+    raw_text = event.text.strip()
+    if raw_text.lower() == "/cancel":
         await handle_cancel(event, admin_id, state)
         return
         
-    phone = text
-    if not phone.startswith('+'):
-        await event.reply("❌ Phone number must start with country code (e.g., `+1`, `+91`).\nEnter `/cancel` to abort.")
+    # Sanitize phone number: strip spaces, hyphens, parentheses
+    clean_digits = re.sub(r'[^\d]', '', raw_text)
+    if not clean_digits or len(clean_digits) < 7:
+        await event.reply(
+            "❌ **Invalid phone number format.**\n\n"
+            "Please include your full country code.\n"
+            "Examples:\n"
+            "• `+12345678900` (US/Canada)\n"
+            "• `+919876543210` (India)\n"
+            "• `+447911123456` (UK)\n\n"
+            "Enter `/cancel` to abort."
+        )
         return
         
+    phone = '+' + clean_digits
     user_client = None
     try:
         api_id = user_data["api_id"]
@@ -1899,25 +1952,179 @@ async def handle_phone(event: Any, admin_id: Optional[int], state: dict, bot_cli
         await save_state(state)
         
         await user_client.disconnect()
-        await event.reply(
-            "**4. OTP Verification Code Sent!**\n\n"
-            "Please check your official Telegram account for the login code.\n"
-            "Format: Send code with spaces, e.g. `1 2 3 4 5` or `12345`.\n\n"
-            "Enter `/cancel` to abort.",
-            parse_mode='markdown'
-        )
+        
+        # Determine code delivery method to instruct user properly
+        code_type = getattr(sent_code, "type", None)
+        if isinstance(code_type, types.auth.SentCodeTypeApp):
+            delivery_msg = (
+                "📲 **OTP Verification Code Sent to Telegram App!**\n\n"
+                "⚠️ **IMPORTANT NOTICE:**\n"
+                "Telegram has sent your login code directly inside the **official Telegram app** "
+                "(in the chat named **\"Telegram\"** / Service Notifications), **NOT** via SMS.\n\n"
+                "1. Open your Telegram app on your phone or desktop.\n"
+                "2. Open the verified **Telegram** service chat.\n"
+                "3. Copy the numeric code and send it here.\n\n"
+                "• Format: `1 2 3 4 5` or `12345`\n"
+                "• Didn't receive code in app? Send `/resend` to request via SMS.\n"
+                "• Send `/cancel` to abort."
+            )
+        elif isinstance(code_type, types.auth.SentCodeTypeSms):
+            delivery_msg = (
+                f"📩 **OTP Verification Code Sent via SMS!**\n\n"
+                f"Telegram has sent the verification code via SMS text message to `{phone}`.\n\n"
+                "Please check your phone text messages and send the code here.\n"
+                "• Format: `1 2 3 4 5` or `12345`\n"
+                "• Send `/cancel` to abort."
+            )
+        elif isinstance(code_type, (types.auth.SentCodeTypeCall, types.auth.SentCodeTypeFlashCall)):
+            delivery_msg = (
+                f"📞 **Telegram Phone Verification!**\n\n"
+                f"Telegram is contacting `{phone}` via automated call.\n"
+                "Listen to the code and send it here.\n"
+                "• Format: `1 2 3 4 5` or `12345`\n"
+                "• Send `/cancel` to abort."
+            )
+        elif isinstance(code_type, types.auth.SentCodeTypeEmailCode):
+            delivery_msg = (
+                "📧 **Verification Code Sent to Email!**\n\n"
+                "Telegram has sent the verification code to your registered login email.\n"
+                "Please check your inbox/spam folder and send the code here.\n"
+                "• Send `/cancel` to abort."
+            )
+        else:
+            delivery_msg = (
+                f"📬 **Verification Code Sent!**\n\n"
+                f"Telegram dispatched the login code for `{phone}`.\n"
+                "Please check your official Telegram app or SMS messages and send the code here.\n"
+                "• Format: `1 2 3 4 5` or `12345`\n"
+                "• Send `/cancel` to abort."
+            )
+            
+        await event.reply(delivery_msg, parse_mode='markdown')
+        
     except FloodWaitError as fwe:
-        await event.reply(f"❌ Telegram rate limit: Too many attempts. Please wait {fwe.seconds} seconds.")
+        await event.reply(f"❌ **Telegram Rate Limit:** Too many attempts. Please wait `{fwe.seconds}` seconds before trying again.")
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+    except (PhoneNumberInvalidError, PhoneNumberUnoccupiedError):
+        await event.reply(
+            "❌ **Invalid Phone Number:** Telegram did not recognize this phone number.\n"
+            "Please check the country code and number, then try again.\n"
+            "Send `/cancel` to start over."
+        )
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+    except PhoneNumberBannedError:
+        await event.reply("❌ **Phone Number Banned:** This phone number has been banned by Telegram.")
+        if str(user_id) in state.get("login_sessions", {}):
+            del state["login_sessions"][str(user_id)]
+            await save_state(state)
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+    except PhoneNumberFloodError:
+        await event.reply("❌ **Too Many Attempts:** Telegram has temporarily blocked code requests for this number. Please wait a few hours.")
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+    except (ApiIdInvalidError, ConnectionApiIdInvalidError, ApiIdPublishedFloodError):
+        await event.reply(
+            "❌ **Invalid Telegram API Credentials:** The API_ID / API_HASH provided is invalid.\n"
+            "Please obtain valid credentials from https://my.telegram.org and retry with `/login custom`."
+        )
+        if str(user_id) in state.get("login_sessions", {}):
+            del state["login_sessions"][str(user_id)]
+            await save_state(state)
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+    except SendCodeUnavailableError:
+        await event.reply(
+            "❌ **Code Delivery Unavailable:** Telegram cannot send an OTP to this number at this moment.\n"
+            "Please open your official Telegram app, log in there first, and then retry."
+        )
         if user_client:
             try:
                 await user_client.disconnect()
             except Exception:
                 pass
     except Exception as e:
-        await event.reply(f"❌ Error sending code: {e}")
-        if str(user_id) in state.get("login_sessions", {}):
-            del state["login_sessions"][str(user_id)]
-            await save_state(state)
+        logger.error(f"Error sending verification code to {phone}: {e}")
+        await event.reply(
+            f"❌ **Error sending verification code:** `{e}`\n\n"
+            "Please verify your phone number and try again, or check `/logs`.\n"
+            "Send `/cancel` to reset."
+        )
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+
+
+async def handle_resend_code(event: Any, admin_id: Optional[int], state: dict):
+    """Handle /resend or /resend_sms command to request SMS code."""
+    if not event.is_private:
+        return
+        
+    user_id = event.sender_id
+    user_data = state.get("login_sessions", {}).get(str(user_id))
+    if not user_data or user_data.get("step") != "code":
+        await event.reply("ℹ️ No active OTP verification waiting. Use `/login` to connect your account.")
+        return
+        
+    phone = user_data.get("phone")
+    api_id = user_data.get("api_id")
+    api_hash = user_data.get("api_hash")
+    session_string = user_data.get("session_string") or ""
+    
+    if not phone or not api_id or not api_hash:
+        await event.reply("❌ Missing session state. Please restart with `/login`.")
+        return
+        
+    user_client = None
+    try:
+        session = StringSession(session_string)
+        user_client = TelegramClient(session, api_id, api_hash)
+        await user_client.connect()
+        
+        sent_code = await user_client.send_code_request(phone, force_sms=True)
+        
+        state["login_sessions"][str(user_id)]["phone_code_hash"] = sent_code.phone_code_hash
+        state["login_sessions"][str(user_id)]["session_string"] = user_client.session.save()
+        await save_state(state)
+        await user_client.disconnect()
+        
+        await event.reply(
+            f"📩 **SMS Verification Code Requested!**\n\n"
+            f"Telegram has been requested to send the code via SMS to `{phone}`.\n"
+            "Please check your mobile phone text messages and send the code here.\n\n"
+            "• Format: `1 2 3 4 5` or `12345`\n"
+            "• Send `/cancel` to abort.",
+            parse_mode='markdown'
+        )
+    except FloodWaitError as fwe:
+        await event.reply(f"❌ **Telegram Rate Limit:** Please wait `{fwe.seconds}` seconds before requesting another code.")
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"Error in /resend for user {user_id}: {e}")
+        await event.reply(f"❌ Could not resend code: `{e}`")
         if user_client:
             try:
                 await user_client.disconnect()
@@ -1936,10 +2143,18 @@ async def handle_code(event: Any, admin_id: Optional[int], state: dict):
     if text.lower() == "/cancel":
         await handle_cancel(event, admin_id, state)
         return
+    if text.lower() in ["/resend", "/resend_sms", "/resendcode"]:
+        await handle_resend_code(event, admin_id, state)
+        return
         
-    code = text.replace(' ', '')
-    if not code.isdigit() or not (4 <= len(code) <= 6):
-        await event.reply("❌ Invalid OTP format. Please send digits only (4 to 6 numbers).\nExample: `1 2 3 4 5`.")
+    code = re.sub(r'[^\d]', '', text)
+    if not code or not (4 <= len(code) <= 8):
+        await event.reply(
+            "❌ **Invalid OTP format.**\n"
+            "Please send digits only (4 to 8 numbers).\n"
+            "Example: `1 2 3 4 5` or `12345`.\n"
+            "Enter `/resend` to request SMS, or `/cancel` to abort."
+        )
         return
         
     user_client = None
@@ -1961,24 +2176,29 @@ async def handle_code(event: Any, admin_id: Optional[int], state: dict):
             await save_state(state)
             await user_client.disconnect()
             await event.reply(
-                "🔐 **Two-Step Verification (2FA) is enabled on this account.**\n\n"
-                "Please enter your 2FA password:\n"
-                "Enter `/cancel` to abort.",
+                "🔐 **Two-Step Verification (2FA) Password Required**\n\n"
+                "Your Telegram account has 2FA enabled.\n"
+                "Please enter your 2FA cloud password now:\n\n"
+                "_(Enter `/cancel` anytime to abort)_",
                 parse_mode='markdown'
             )
         except PhoneCodeInvalidError:
-            await event.reply("❌ Invalid OTP code. Please check and try again.")
+            await event.reply("❌ **Incorrect OTP Code.** Please check the code in your Telegram app/SMS and send again.\n(Or enter `/resend` for SMS, `/cancel` to abort)")
             await user_client.disconnect()
         except PhoneCodeExpiredError:
-            await event.reply("❌ OTP code expired. Please restart with `/login`.")
-            if str(user_id) in state.get("login_sessions", {}):
-                del state["login_sessions"][str(user_id)]
-                await save_state(state)
+            await event.reply("❌ **OTP Code Expired.** Please type `/resend` to get a fresh code, or `/login` to restart.")
             await user_client.disconnect()
             
+    except FloodWaitError as fwe:
+        await event.reply(f"❌ Telegram rate limit: Please wait `{fwe.seconds}` seconds.")
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Error during sign_in for user {user_id}: {e}")
-        await event.reply(f"❌ Error signing in: {e}")
+        await event.reply(f"❌ Error signing in: `{e}`\nSend `/cancel` to start over.")
         if user_client:
             try:
                 await user_client.disconnect()
@@ -3020,7 +3240,8 @@ async def main():
     client.on(events.NewMessage(pattern=r'^/download_logs$'))(lambda e: handle_download_logs(e, admin_id, state))
     client.on(events.NewMessage(pattern=r'/loglevel\s+\S+'))(lambda e: handle_loglevel(e, admin_id, state))
     
-    client.on(events.NewMessage(pattern=r'^/login$'))(lambda e: handle_login(e, admin_id, client, state))
+    client.on(events.NewMessage(pattern=r'^/login(?:\s+(.*))?$'))(lambda e: handle_login(e, admin_id, client, state))
+    client.on(events.NewMessage(pattern=r'^/(?:resend|resend_sms|resendcode)$'))(lambda e: handle_resend_code(e, admin_id, state))
     client.on(events.NewMessage(pattern=r'^/cancel$'))(lambda e: handle_cancel(e, admin_id, state))
     client.on(events.NewMessage(pattern=r'^/logout$'))(lambda e: handle_logout(e, admin_id, state))
     client.on(events.NewMessage(pattern=r'^/mystatus$'))(lambda e: handle_mystatus(e, admin_id, state))

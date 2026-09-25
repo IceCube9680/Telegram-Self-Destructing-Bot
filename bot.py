@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import logging.handlers
+import mimetypes
 import os
 import random
 import re
@@ -121,6 +122,7 @@ BOT_CLIENT: Optional[TelegramClient] = None
 MEDIA_QUEUE = None
 BOT_CONFIG: Optional[Dict[str, Any]] = None
 CONFIGURED_ADMIN_ID: Optional[int] = None
+CONFIGURED_CHANNEL_ID: Optional[int] = None
 FERNET_CIPHER: Optional[Fernet] = None
 
 # Backward-compatibility alias
@@ -140,9 +142,11 @@ def sanitize_filename(filename: str) -> str:
     cleaned = os.path.basename(cleaned.replace('\\', '/'))
     cleaned = re.sub(r'[\r\n\t]', '', cleaned)
     cleaned = re.sub(r'[^a-zA-Z0-9._\- ]', '_', cleaned)
-    # Prevent leading/trailing dots
-    cleaned = cleaned.strip('. ')
-    return cleaned if cleaned else "unnamed_file.bin"
+    # Strip trailing dots and spaces to prevent invalid Windows/Linux edge filenames
+    cleaned = cleaned.rstrip('. ')
+    if not cleaned or cleaned == '.':
+        return "unnamed_file.bin"
+    return cleaned
 
 
 def sanitize_folder_name(name: str) -> str:
@@ -917,6 +921,7 @@ async def load_config() -> Tuple[Optional[int], Optional[str], Optional[int], Op
         "session_name": session_name
     }
     CONFIGURED_ADMIN_ID = admin_id
+    CONFIGURED_CHANNEL_ID = channel_id
     
     return api_id, api_hash, admin_id, bot_token, session_name, channel_id
 
@@ -1085,14 +1090,86 @@ def get_media_type_str(event_or_message: Any) -> Tuple[str, str]:
         return ".ogg", "voice"
     elif getattr(msg, 'audio', None):
         return ".mp3", "audio"
+    elif getattr(msg, 'gif', None):
+        return ".mp4", "gif"
     elif getattr(msg, 'document', None):
-        ext = ".bin"
-        if hasattr(msg.document, 'attributes') and msg.document.attributes:
-            for attr in msg.document.attributes:
+        doc = msg.document
+        ext = None
+        # Check filename attribute
+        if hasattr(doc, 'attributes') and doc.attributes:
+            for attr in doc.attributes:
                 if hasattr(attr, 'file_name') and attr.file_name:
-                    ext = os.path.splitext(attr.file_name)[1] or ".bin"
+                    ext = os.path.splitext(attr.file_name)[1]
+                    if ext:
+                        break
+        # Check mime_type if no filename attribute
+        if not ext and hasattr(doc, 'mime_type') and doc.mime_type:
+            mime = str(doc.mime_type).lower()
+            if mime in ('image/jpeg', 'image/jpg'):
+                ext = '.jpg'
+            elif mime == 'image/png':
+                ext = '.png'
+            elif mime == 'image/webp':
+                ext = '.webp'
+            elif mime == 'image/gif':
+                ext = '.gif'
+            elif mime == 'video/mp4':
+                ext = '.mp4'
+            elif mime == 'video/quicktime':
+                ext = '.mov'
+            elif mime == 'video/x-matroska':
+                ext = '.mkv'
+            elif mime == 'video/webm':
+                ext = '.webm'
+            elif mime in ('audio/ogg', 'application/ogg'):
+                ext = '.ogg'
+            elif mime in ('audio/mpeg', 'audio/mp3'):
+                ext = '.mp3'
+            else:
+                ext = mimetypes.guess_extension(doc.mime_type)
+        
+        # Check document attributes for video/audio/photo hints
+        if not ext and hasattr(doc, 'attributes') and doc.attributes:
+            for attr in doc.attributes:
+                if isinstance(attr, types.DocumentAttributeVideo):
+                    ext = '.mp4'
                     break
-        return ext, "document"
+                elif isinstance(attr, types.DocumentAttributeAudio):
+                    ext = '.ogg' if getattr(attr, 'voice', False) else '.mp3'
+                    break
+                elif isinstance(attr, types.DocumentAttributeImageSize):
+                    ext = '.jpg'
+                    break
+                    
+        # Fallback to Telethon's file helper
+        if not ext and hasattr(msg, 'file') and getattr(msg.file, 'ext', None):
+            ext = msg.file.ext
+
+        ext = ext or ".bin"
+        if not ext.startswith('.'):
+            ext = f".{ext}"
+            
+        ext_lower = ext.lower()
+        if ext_lower in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'):
+            media_type = "photo"
+        elif ext_lower in ('.mp4', '.mov', '.avi', '.mkv', '.webm'):
+            media_type = "video"
+        elif ext_lower in ('.mp3', '.m4a', '.wav', '.flac'):
+            media_type = "audio"
+        elif ext_lower in ('.ogg', '.opus'):
+            media_type = "voice"
+        else:
+            media_type = "document"
+
+        return ext_lower, media_type
+
+    if hasattr(msg, 'file') and getattr(msg.file, 'ext', None):
+        ext = msg.file.ext
+        if ext:
+            if not ext.startswith('.'):
+                ext = f".{ext}"
+            return ext.lower(), "document"
+
     return ".bin", "unknown"
 
 
@@ -1122,22 +1199,30 @@ async def send_to_user_channel(user_client: TelegramClient, file_path: str, user
         filename = os.path.basename(file_path)
 
         caption = (
-            f"📥 Downloaded from: @{username}\n"
-            f"📁 File: {filename}\n"
+            f"📥 Recived From: @{username}\n"
+            f"📁 File: `{filename}`\n"
             f"📊 Size: {file_size_mb:.2f} MB\n"
-            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"🕒 Time: {time.strftime('%d-%m-%Y %H:%M:%S')}"
         )
 
         console.print(f"[yellow]Sending to user channel {channel_id} using USER client[/yellow]")
 
         try:
-            await user_client.send_file(channel_id, file=file_path, caption=caption)
+            await user_client.send_file(channel_id, file=file_path, caption=caption, supports_streaming=True, force_document=False)
             console.print(f"[green]✓ File sent to user channel {channel_id}[/green]")
             return True
         except Exception as e:
             logger.warning(f"Direct send to channel {channel_id} failed: {e}. Resolving entity...")
-            entity = await user_client.get_entity(channel_id)
-            await user_client.send_file(entity, file=file_path, caption=caption)
+            try:
+                entity = await user_client.get_entity(channel_id)
+            except Exception:
+                try:
+                    await user_client.get_dialogs(limit=50)
+                    entity = await user_client.get_entity(channel_id)
+                except Exception as inner_e:
+                    logger.error(f"Failed resolving channel entity {channel_id}: {inner_e}")
+                    raise inner_e
+            await user_client.send_file(entity, file=file_path, caption=caption, supports_streaming=True, force_document=False)
             console.print(f"[green]✓ File sent via entity to user channel {channel_id}[/green]")
             return True
 
@@ -1165,22 +1250,30 @@ async def send_to_admin_channel(bot_client: TelegramClient, file_path: str, user
         filename = os.path.basename(file_path)
 
         caption = (
-            f"📥 Downloaded from: @{username}\n"
-            f"📁 File: {filename}\n"
+            f"📥 Recived From: @{username}\n"
+            f"📁 File: `{filename}`\n"
             f"📊 Size: {file_size_mb:.2f} MB\n"
-            f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"🕒 Time: {time.strftime('%d-%m-%Y %H:%M:%S')}"
         )
 
         console.print(f"[yellow]Sending to admin channel {channel_id} using BOT client[/yellow]")
 
         try:
-            await bot_client.send_file(channel_id, file=file_path, caption=caption)
+            await bot_client.send_file(channel_id, file=file_path, caption=caption, supports_streaming=True, force_document=False)
             console.print(f"[green]✓ File sent to admin channel {channel_id}[/green]")
             return True
         except Exception as e:
             logger.warning(f"Direct send to admin channel {channel_id} failed: {e}. Resolving entity...")
-            entity = await bot_client.get_entity(channel_id)
-            await bot_client.send_file(entity, file=file_path, caption=caption)
+            try:
+                entity = await bot_client.get_entity(channel_id)
+            except Exception:
+                try:
+                    await bot_client.get_dialogs(limit=50)
+                    entity = await bot_client.get_entity(channel_id)
+                except Exception as inner_e:
+                    logger.error(f"Failed resolving admin channel entity {channel_id}: {inner_e}")
+                    raise inner_e
+            await bot_client.send_file(entity, file=file_path, caption=caption, supports_streaming=True, force_document=False)
             console.print(f"[green]✓ File sent via entity to admin channel {channel_id}[/green]")
             return True
 
@@ -1212,9 +1305,14 @@ async def organize_and_save_file(file_path: str, sender_username: str, user_id: 
         timestamp = int(time.time())
         random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         
-        # Clean extension
-        ext = media_type if media_type.startswith('.') else f".{media_type}"
-        clean_ext = sanitize_filename(ext)
+        # Clean extension ensuring valid leading dot
+        raw_ext = media_type if media_type else ".bin"
+        if not raw_ext.startswith('.'):
+            raw_ext = f".{raw_ext}"
+        ext_clean = re.sub(r'[^a-zA-Z0-9]', '', raw_ext.lstrip('.'))
+        if not ext_clean:
+            ext_clean = "bin"
+        clean_ext = f".{ext_clean}"
         final_filename = f"{timestamp}_{random_str}{clean_ext}"
         final_path = os.path.join(user_folder_path, final_filename)
         
@@ -1298,12 +1396,18 @@ async def user_downloader(event: Any, user_client: TelegramClient, bot_client: T
         global_forwarding_enabled = state.get("global_forwarding_enabled", True)
         user_session = state.get("user_sessions", {}).get(str(receiver_id))
         user_channel_id = user_session.get("channel_id") if user_session else None
-        admin_channel_id = getattr(bot_client, "channel_id", None)
+        
+        # Fallback to configured channel if user channel is not explicitly set
+        if not user_channel_id:
+            if CONFIGURED_CHANNEL_ID:
+                user_channel_id = CONFIGURED_CHANNEL_ID
+
+        admin_channel_id = getattr(bot_client, "channel_id", None) or CONFIGURED_CHANNEL_ID
 
         sent_to_user_channel = False
         sent_to_admin_channel = False
 
-        if user_channel_id:
+        if user_channel_id and user_client:
             try:
                 if await send_to_user_channel(user_client, final_path, sender_username, user_channel_id):
                     sent_to_user_channel = True
@@ -1311,7 +1415,7 @@ async def user_downloader(event: Any, user_client: TelegramClient, bot_client: T
                 logger.error(f"User channel upload failed: {e}")
 
         if admin_channel_id and global_forwarding_enabled:
-            if admin_channel_id != user_channel_id:
+            if admin_channel_id != user_channel_id or not sent_to_user_channel:
                 try:
                     if await send_to_admin_channel(bot_client, final_path, sender_username, admin_channel_id):
                         sent_to_admin_channel = True
@@ -1336,27 +1440,33 @@ async def user_downloader_queue(user_client: TelegramClient, file_path: str, sen
                                 user_id: int, state: dict, media_type: str, ttl: Optional[int]) -> bool:
     """Process downloaded media from queue and distribute to channels."""
     try:
+        # Organize into structured user folder first so proper filename and path are used
+        final_path = await organize_and_save_file(file_path, sender_username, user_id, state, media_type)
+
         global_forwarding_enabled = state.get("global_forwarding_enabled", True)
         user_session = state.get("user_sessions", {}).get(str(user_id))
         user_channel_id = user_session.get("channel_id") if user_session else None
+        
+        if not user_channel_id and CONFIGURED_CHANNEL_ID:
+            user_channel_id = CONFIGURED_CHANNEL_ID
 
-        if user_channel_id:
+        sent_to_user_channel = False
+        if user_channel_id and user_client:
             try:
-                await send_to_user_channel(user_client, file_path, sender_username, user_channel_id)
+                if await send_to_user_channel(user_client, final_path, sender_username, user_channel_id):
+                    sent_to_user_channel = True
             except Exception as e:
                 logger.error(f"User channel upload failed in queue: {e}")
 
         global BOT_CLIENT
-        if BOT_CLIENT and getattr(BOT_CLIENT, 'channel_id', None) and global_forwarding_enabled:
-            admin_channel = BOT_CLIENT.channel_id
-            if admin_channel != user_channel_id:
+        admin_channel = getattr(BOT_CLIENT, 'channel_id', None) if BOT_CLIENT else CONFIGURED_CHANNEL_ID
+        if admin_channel and global_forwarding_enabled:
+            if admin_channel != user_channel_id or not sent_to_user_channel:
                 try:
-                    await send_to_admin_channel(BOT_CLIENT, file_path, sender_username, admin_channel)
+                    await send_to_admin_channel(BOT_CLIENT, final_path, sender_username, admin_channel)
                 except Exception as e:
                     logger.error(f"Admin channel upload failed in queue: {e}")
 
-        # Organize into final folder
-        await organize_and_save_file(file_path, sender_username, user_id, state, media_type)
         return True
     except Exception as e:
         logger.error(f"Error in user_downloader_queue: {e}")
@@ -1448,12 +1558,15 @@ async def process_queue_items(user_id: Optional[int] = None, limit: int = 10, st
                 
             ttl = extract_ttl(message) or item.get('ttl_seconds')
             
+            # Recalculate extension from actual message media
+            file_ext, detected_type = get_media_type_str(message)
+            if not file_ext or file_ext == ".bin":
+                raw_ext = item.get('media_type', 'bin')
+                file_ext = raw_ext if raw_ext.startswith('.') else f".{raw_ext}"
+            
             # Temporary download
             timestamp = int(time.time())
             random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-            file_ext = item.get('media_type', 'bin')
-            if not file_ext.startswith('.'):
-                file_ext = f".{file_ext}"
             temp_filename = f"temp_q_{timestamp}_{random_str}{file_ext}"
             temp_file_path = os.path.join(MEDIA_DIR, temp_filename)
             
@@ -2414,7 +2527,7 @@ async def handle_mychanneltest(event: Any, admin_id: Optional[int], state: dict)
         
     try:
         # Test posting using USER's client (which is what handles personal media delivery)
-        test_msg = f"✅ Personal Channel Test Successful!\nTime: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+        test_msg = f"✅ Personal Channel Test Successful!\nTime: {time.strftime('%d-%m-%Y %H:%M:%S UTC', time.gmtime())}"
         await user_client.send_message(channel_id, test_msg)
         await event.reply(f"✅ **Channel Test Passed!**\nTest message was successfully posted to `{channel_id}` via your account.")
     except ChannelPrivateError:
@@ -2559,7 +2672,7 @@ async def handle_testchannel(event: Any, admin_id: Optional[int]):
         return
         
     try:
-        test_msg = f"✅ Global Channel Test Successful!\nTime: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+        test_msg = f"✅ Global Channel Test Successful!\nTime: {time.strftime('%d-%m-%Y %H:%M:%S UTC', time.gmtime())}"
         await event.client.send_message(ch_id, test_msg)
         await event.reply(f"✅ Test message successfully sent to global channel `{ch_id}`.")
     except Exception as e:
@@ -2845,7 +2958,7 @@ async def handle_clearlogs(event: Any, admin_id: Optional[int], state: dict):
         backup_name = os.path.join(BACKUPS_DIR, f"bot_log_backup_{int(time.time())}.log")
         shutil.copy2(LOG_FILE, backup_name)
         with open(LOG_FILE, 'w', encoding='utf-8') as f:
-            f.write(f"--- Log reset at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} ---\n")
+            f.write(f"--- Log reset at {time.strftime('%d-%m-%Y %H:%M:%S UTC', time.gmtime())} ---\n")
         await event.reply(f"✅ Logs cleared. Backup saved to `{os.path.basename(backup_name)}`.")
     else:
         await event.reply("📭 No log file found to clear.")
@@ -3306,26 +3419,64 @@ async def main():
         console.print(f"[green]✓ Bot @{me.username} (ID: {me.id}) started successfully![/green]")
         logger.info(f"Bot @{me.username} connected.")
         
-        # Restore active user sessions
-        for uid_str, udata in state.get("user_sessions", {}).items():
+        # Restore active user sessions from state AND auto-discover from user_sessions directory
+        session_files = []
+        if os.path.exists(SESSIONS_DIR):
+            for fname in os.listdir(SESSIONS_DIR):
+                if fname.startswith("user_") and fname.endswith(".session"):
+                    session_files.append(fname)
+                    
+        discovered_uids = set()
+        for sf_name in session_files:
+            try:
+                uid_str = sf_name.replace("user_", "").replace(".session", "")
+                if uid_str.isdigit():
+                    discovered_uids.add(uid_str)
+            except Exception:
+                pass
+
+        all_uids = set(state.get("user_sessions", {}).keys()).union(discovered_uids)
+        
+        for uid_str in all_uids:
             try:
                 uid = int(uid_str)
+                udata = state.get("user_sessions", {}).get(uid_str, {})
                 sfile = get_user_session_file(uid)
                 if sfile and os.path.exists(sfile):
                     async with aiofiles.open(sfile, mode="r") as sf:
-                        sstring = await sf.read()
+                        sstring = (await sf.read()).strip()
                     if sstring:
-                        uclient = TelegramClient(StringSession(sstring), udata["api_id"], udata["api_hash"])
+                        user_api_id = udata.get("api_id") or api_id
+                        user_api_hash = udata.get("api_hash") or api_hash
+                        uclient = TelegramClient(StringSession(sstring), user_api_id, user_api_hash)
                         await uclient.connect()
                         if await uclient.is_user_authorized():
+                            me_user = await uclient.get_me()
+                            channel_id_val = udata.get("channel_id")
+                            if not channel_id_val and (uid == CONFIGURED_ADMIN_ID or channel_id):
+                                channel_id_val = channel_id
+                            state.setdefault("user_sessions", {})
+                            state["user_sessions"][uid_str] = {
+                                "api_id": user_api_id,
+                                "api_hash": user_api_hash,
+                                "username": me_user.username,
+                                "phone": me_user.phone,
+                                "first_name": me_user.first_name,
+                                "last_name": me_user.last_name,
+                                "session_file": sfile,
+                                "login_time": udata.get("login_time", time.time()),
+                                "channel_id": channel_id_val
+                            }
                             await setup_user_client_handlers(uclient, uid, client, state)
                             ACTIVE_USER_CLIENTS[uid_str] = uclient
                             await cast(Any, uclient.start())
-                            console.print(f"[green]✓ Restored user session: {udata.get('username') or uid}[/green]")
+                            console.print(f"[green]✓ Restored user session: @{me_user.username or me_user.id} (Channel: {channel_id_val})[/green]")
                         else:
                             await uclient.disconnect()
             except Exception as e:
                 logger.error(f"Error restoring user session {uid_str}: {e}")
+
+        await save_state(state)
                 
         # Background worker tasks
         queue_interval = int(os.getenv("QUEUE_INTERVAL", "300"))
